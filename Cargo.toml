@@ -1,0 +1,11 @@
+[package]
+name = "rmux-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
+egui = "0.33.3"
+egui_dock = "0.18.0"
+serde = { version = "1.0.228", features = ["derive"] }
+uuid = { version = "1.21.0", features = ["v4", "serde"] }

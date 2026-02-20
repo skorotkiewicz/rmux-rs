@@ -1,11 +1,12 @@
-use eframe::egui;
-use egui_dock::{tab_viewer::OnCloseResponse, DockArea, DockState, TabViewer};
-use std::collections::HashMap;
-use uuid::Uuid;
-
+use crate::ai::llm_client::LlmClient;
 use crate::notification::NotificationStore;
 use crate::terminal::TerminalPane;
 use crate::workspace::Workspace;
+use eframe::egui;
+use egui_dock::{tab_viewer::OnCloseResponse, DockArea, DockState, TabViewer};
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct RmuxApp {
     dock_state: DockState<Tab>,
@@ -15,6 +16,9 @@ pub struct RmuxApp {
     notifications: NotificationStore,
     sidebar_width: f32,
     show_sidebar: bool,
+    llm_client: Arc<LlmClient>,
+    presets: Vec<String>,
+    selected_preset: Option<String>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -55,6 +59,16 @@ impl RmuxApp {
         let tab = Tab::new(workspace_id, "Terminal 1".to_string(), PaneType::Terminal);
         let dock_state = DockState::new(vec![tab]);
 
+        let presets = Self::load_presets();
+        let llm_client = Arc::new(LlmClient::default_client());
+
+        let client = llm_client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.initialize().await {
+                eprintln!("[rmux] Failed to initialize: {}", e);
+            }
+        });
+
         Self {
             dock_state,
             workspaces,
@@ -63,7 +77,38 @@ impl RmuxApp {
             notifications: NotificationStore::new(),
             sidebar_width: 200.0,
             show_sidebar: true,
+            llm_client,
+            presets,
+            selected_preset: None,
         }
+    }
+
+    fn load_presets() -> Vec<String> {
+        let config_paths: Vec<&str> = vec!["config.yml", "config.yaml"];
+
+        for path in &config_paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                    if let Some(presets) = value.get("presets").and_then(|p| p.as_mapping()) {
+                        return presets.keys().filter_map(|k| k.as_str().map(|s| s.to_string())).collect();
+                    }
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    fn switch_preset(&mut self, preset: &str) {
+        let client = Arc::new(LlmClient::with_preset(preset));
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client_clone.initialize().await {
+                eprintln!("[rmux] Failed to initialize preset: {}", e);
+            }
+        });
+        self.llm_client = client;
+        self.selected_preset = Some(preset.to_string());
     }
 
     fn count_tabs(&self) -> usize {
@@ -93,11 +138,7 @@ impl RmuxApp {
     fn add_terminal(&mut self) {
         if let Some(workspace_id) = self.selected_workspace {
             let num = self.count_tabs() + 1;
-            let tab = Tab::new(
-                workspace_id,
-                format!("Terminal {}", num),
-                PaneType::Terminal,
-            );
+            let tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
             self.dock_state.push_to_focused_leaf(tab);
         }
     }
@@ -106,17 +147,8 @@ impl RmuxApp {
         if let Some(workspace_id) = self.selected_workspace {
             if let Some((surface, node)) = self.dock_state.focused_leaf() {
                 let num = self.count_tabs() + 1;
-                let new_tab = Tab::new(
-                    workspace_id,
-                    format!("Terminal {}", num),
-                    PaneType::Terminal,
-                );
-                self.dock_state[surface].split_tabs(
-                    node,
-                    egui_dock::Split::Right,
-                    0.5,
-                    vec![new_tab],
-                );
+                let new_tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
+                self.dock_state[surface].split_tabs(node, egui_dock::Split::Right, 0.5, vec![new_tab]);
             }
         }
     }
@@ -125,17 +157,8 @@ impl RmuxApp {
         if let Some(workspace_id) = self.selected_workspace {
             if let Some((surface, node)) = self.dock_state.focused_leaf() {
                 let num = self.count_tabs() + 1;
-                let new_tab = Tab::new(
-                    workspace_id,
-                    format!("Terminal {}", num),
-                    PaneType::Terminal,
-                );
-                self.dock_state[surface].split_tabs(
-                    node,
-                    egui_dock::Split::Below,
-                    0.5,
-                    vec![new_tab],
-                );
+                let new_tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
+                self.dock_state[surface].split_tabs(node, egui_dock::Split::Below, 0.5, vec![new_tab]);
             }
         }
     }
@@ -165,6 +188,28 @@ impl RmuxApp {
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Presets");
+            ui.separator();
+
+            if self.presets.is_empty() {
+                ui.label(egui::RichText::new("No presets in config").italics().weak());
+            } else {
+                for preset in &self.presets.clone() {
+                    let is_selected = self.selected_preset.as_ref() == Some(preset);
+                    if ui.selectable_label(is_selected, preset).clicked() {
+                        self.switch_preset(preset);
+                    }
+                }
+            }
+
+            // Show workspace info
+            if let Some(workspace) = self.llm_client.get_workspace() {
+                ui.add_space(5.0);
+                ui.label(egui::RichText::new("Workspace:").weak());
+                ui.label(egui::RichText::new(workspace.to_string_lossy()).small().weak());
+            }
+
+            ui.add_space(10.0);
             ui.heading("Workspaces");
             ui.separator();
 
@@ -175,8 +220,7 @@ impl RmuxApp {
                     let has_notifications = self.notifications.has_unread_for_workspace(id);
 
                     let text = if has_notifications {
-                        egui::RichText::new(&workspace.name)
-                            .color(egui::Color32::from_rgb(100, 149, 237))
+                        egui::RichText::new(&workspace.name).color(egui::Color32::from_rgb(100, 149, 237))
                     } else {
                         egui::RichText::new(&workspace.name)
                     };
@@ -225,6 +269,12 @@ impl eframe::App for RmuxApp {
                 if ui.button("Clear Notifications").clicked() {
                     self.clear_all_notifications();
                 }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(ref preset) = self.selected_preset {
+                        ui.label(egui::RichText::new(format!("Preset: {}", preset)).weak());
+                    }
+                });
             });
         });
 
@@ -233,6 +283,7 @@ impl eframe::App for RmuxApp {
                 ui,
                 &mut TabViewerImpl {
                     notifications: &mut self.notifications,
+                    llm_client: self.llm_client.clone(),
                 },
             );
         });
@@ -241,6 +292,7 @@ impl eframe::App for RmuxApp {
 
 struct TabViewerImpl<'a> {
     notifications: &'a mut NotificationStore,
+    llm_client: Arc<LlmClient>,
 }
 
 impl TabViewer for TabViewerImpl<'_> {
@@ -257,7 +309,7 @@ impl TabViewer for TabViewerImpl<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab.pane_type {
             PaneType::Terminal => {
-                TerminalPane::show(ui, tab, self.notifications);
+                TerminalPane::show(ui, tab, self.notifications, self.llm_client.clone());
             }
             PaneType::Browser => {
                 ui.vertical_centered(|ui| {

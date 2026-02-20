@@ -1,13 +1,16 @@
-use eframe::egui;
-
+mod ai;
 mod app;
 mod notification;
 mod terminal;
 mod workspace;
 
 use app::RmuxApp;
+use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let _guard = rt.enter();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])

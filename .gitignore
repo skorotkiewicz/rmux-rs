@@ -1,3 +1,6 @@
 /target
 /rmux-rs
 /cmux
+config.yml
+/workspace
+/undead

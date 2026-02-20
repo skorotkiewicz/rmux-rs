@@ -1,0 +1,574 @@
+use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use super::agent::AgentContext;
+use super::mcp::McpManager;
+use super::tools::{Tool, ToolCall, ToolExecutor};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, alias = "api-key")]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub system: Option<String>,
+    #[serde(default = "default_temperature")]
+    pub temp: f32,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, super::mcp::McpServerConfig>,
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub mcp: bool,
+    #[serde(default = "default_true")]
+    pub tools: bool,
+}
+
+fn default_temperature() -> f32 {
+    0.7
+}
+
+fn default_max_tokens() -> u32 {
+    2048
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ConfigFile {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default, alias = "api-key")]
+    api_key: Option<String>,
+    #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
+    temp: Option<f32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    mcp_servers: HashMap<String, super::mcp::McpServerConfig>,
+    #[serde(default)]
+    workspace: Option<PathBuf>,
+    #[serde(default)]
+    mcp: Option<bool>,
+    #[serde(default)]
+    tools: Option<bool>,
+    #[serde(default)]
+    presets: HashMap<String, ConfigFile>,
+}
+
+impl Config {
+    pub fn load() -> Self {
+        Self::load_with_preset(None)
+    }
+
+    pub fn load_with_preset(preset: Option<&str>) -> Self {
+        let preset: Option<String> = preset
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("RMUX_PRESET").ok());
+
+        let config_paths: Vec<&str> = vec!["config.yml", "config.yaml"];
+
+        for path in &config_paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(file) = serde_yaml::from_str::<ConfigFile>(&content) {
+                    let config = Self::merge_config(&file, preset.as_deref());
+                    if let Some(p) = &preset {
+                        eprintln!("[rmux] Loaded preset '{}' from: {}", p, path);
+                    } else {
+                        eprintln!("[rmux] Loaded config from: {}", path);
+                    }
+                    if let Some(ref ws) = config.workspace {
+                        eprintln!("[rmux] Workspace: {:?}", ws);
+                    }
+                    eprintln!("[rmux] MCP: {}, Tools: {}", config.mcp, config.tools);
+                    return config;
+                }
+            }
+        }
+
+        if let Some(config_dir) = dirs::config_dir() {
+            let path = config_dir.join("rmux/config.yml");
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(file) = serde_yaml::from_str::<ConfigFile>(&content) {
+                    let config = Self::merge_config(&file, preset.as_deref());
+                    eprintln!("[rmux] Loaded config from: {:?}", path);
+                    return config;
+                }
+            }
+        }
+
+        eprintln!("[rmux] No config.yml found, using defaults");
+        Self::default()
+    }
+
+    fn merge_config(file: &ConfigFile, preset: Option<&str>) -> Self {
+        let mut base = file.clone();
+
+        if let Some(preset_name) = preset {
+            if let Some(preset_config) = file.presets.get(preset_name) {
+                if preset_config.mode.is_some() {
+                    base.mode = preset_config.mode.clone();
+                }
+                if preset_config.endpoint.is_some() {
+                    base.endpoint = preset_config.endpoint.clone();
+                }
+                if preset_config.model.is_some() {
+                    base.model = preset_config.model.clone();
+                }
+                if preset_config.api_key.is_some() {
+                    base.api_key = preset_config.api_key.clone();
+                }
+                if preset_config.system.is_some() {
+                    base.system = preset_config.system.clone();
+                }
+                if preset_config.temp.is_some() {
+                    base.temp = preset_config.temp;
+                }
+                if preset_config.max_tokens.is_some() {
+                    base.max_tokens = preset_config.max_tokens;
+                }
+                if !preset_config.mcp_servers.is_empty() {
+                    base.mcp_servers = preset_config.mcp_servers.clone();
+                }
+                if preset_config.workspace.is_some() {
+                    base.workspace = preset_config.workspace.clone();
+                }
+                if preset_config.mcp.is_some() {
+                    base.mcp = preset_config.mcp;
+                }
+                if preset_config.tools.is_some() {
+                    base.tools = preset_config.tools;
+                }
+            } else {
+                eprintln!("[rmux] Preset '{}' not found", preset_name);
+            }
+        }
+
+        Self {
+            mode: base.mode,
+            endpoint: base.endpoint.unwrap_or_else(|| "http://localhost:8080/v1".to_string()),
+            model: base.model.unwrap_or_else(|| "default".to_string()),
+            api_key: base.api_key,
+            system: base.system,
+            temp: base.temp.unwrap_or(0.7),
+            max_tokens: base.max_tokens.unwrap_or(2048),
+            mcp_servers: base.mcp_servers,
+            workspace: base.workspace,
+            mcp: base.mcp.unwrap_or(true),
+            tools: base.tools.unwrap_or(true),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    temperature: f32,
+    max_tokens: u32,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Tool>>,
+}
+
+#[derive(Deserialize)]
+struct StreamResponse {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: Delta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Delta {
+    content: Option<String>,
+    tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct DeltaToolCall {
+    id: Option<String>,
+    #[serde(rename = "type")]
+    tool_type: Option<String>,
+    function: Option<DeltaFunction>,
+}
+
+#[derive(Deserialize)]
+struct DeltaFunction {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+pub enum StreamEvent {
+    Text(String),
+    ToolCallStart { id: String, name: String },
+    ToolCallDelta(String),
+    ToolCallEnd,
+    Done,
+    Error(String),
+}
+
+pub struct LlmClient {
+    client: Client,
+    config: Config,
+    conversations: Arc<RwLock<Vec<ChatMessage>>>,
+    tools: Arc<RwLock<Vec<Tool>>>,
+    tool_executor: Option<ToolExecutor>,
+    mcp_manager: Arc<RwLock<McpManager>>,
+    agent_context: Option<AgentContext>,
+}
+
+impl LlmClient {
+    pub fn new(config: Config) -> Self {
+        let tool_executor = if config.tools && config.workspace.is_some() {
+            config.workspace.as_ref().map(|ws| ToolExecutor::new(ws.clone()))
+        } else {
+            None
+        };
+
+        let agent_context = config.workspace.as_ref().map(|ws| {
+            AgentContext::load(ws)
+        });
+
+        Self {
+            client: Client::new(),
+            config,
+            conversations: Arc::new(RwLock::new(Vec::new())),
+            tools: Arc::new(RwLock::new(Vec::new())),
+            tool_executor,
+            mcp_manager: Arc::new(RwLock::new(McpManager::new())),
+            agent_context,
+        }
+    }
+
+    pub fn from_config(config: Config) -> Self {
+        Self::new(config)
+    }
+
+    pub fn default_client() -> Self {
+        Self::from_config(Config::load())
+    }
+
+    pub fn with_preset(preset: &str) -> Self {
+        Self::from_config(Config::load_with_preset(Some(preset)))
+    }
+
+    pub fn get_workspace(&self) -> Option<&PathBuf> {
+        self.config.workspace.as_ref()
+    }
+
+    fn build_system_prompt(&self) -> String {
+        let mut prompt = self.config.system.clone().unwrap_or_else(|| {
+            "You are a helpful assistant.".to_string()
+        });
+
+        if let Some(ref agent) = self.agent_context {
+            if agent.has_content() {
+                prompt.push_str(&agent.to_system_prompt());
+            }
+        }
+
+        if self.tool_executor.is_some() {
+            prompt.push_str("\n\nYou have access to file system tools in the workspace directory. You can read, write, create, and edit files.");
+        }
+
+        prompt
+    }
+
+    pub async fn initialize(&self) -> Result<()> {
+        let mut tools = self.tools.write().await;
+
+        // Add built-in tools only if enabled and workspace is configured
+        if self.config.tools && self.tool_executor.is_some() {
+            tools.extend(ToolExecutor::get_tools());
+            eprintln!("[rmux] File tools enabled (sandboxed to workspace)");
+        }
+
+        // Load MCP servers only if enabled
+        if self.config.mcp && !self.config.mcp_servers.is_empty() {
+            let mcp_config = super::mcp::McpConfig {
+                mcp_servers: self.config.mcp_servers.clone(),
+            };
+            let mut manager = self.mcp_manager.write().await;
+            manager.load_from_config(&mcp_config).await?;
+            tools.extend(manager.get_all_tools());
+        }
+
+        // Add system message to start of conversation
+        let mut messages = self.conversations.write().await;
+        if messages.is_empty() {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(self.build_system_prompt()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn get_tools(&self) -> Arc<RwLock<Vec<Tool>>> {
+        self.tools.clone()
+    }
+
+    pub async fn clear_conversation(&self) {
+        let mut messages = self.conversations.write().await;
+        messages.clear();
+        // Re-add system message
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(self.build_system_prompt()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
+
+    pub async fn get_conversation(&self) -> Vec<ChatMessage> {
+        self.conversations.read().await.clone()
+    }
+
+    fn build_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        if let Some(ref api_key) = self.config.api_key {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", api_key).parse().unwrap(),
+            );
+        }
+        headers
+    }
+
+    pub async fn send_message_stream<F>(&self, user_message: &str, mut on_event: F) -> Result<String>
+    where
+        F: FnMut(StreamEvent) + Send,
+    {
+        let mut messages = self.conversations.write().await;
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(user_message.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+
+        let mut full_response = String::new();
+        let tools_guard = self.tools.read().await;
+        let tools_option = if tools_guard.is_empty() {
+            None
+        } else {
+            Some(tools_guard.clone())
+        };
+        drop(tools_guard);
+
+        loop {
+            let request = ChatRequest {
+                model: self.config.model.clone(),
+                messages: messages.clone(),
+                temperature: self.config.temp,
+                max_tokens: self.config.max_tokens,
+                stream: true,
+                tools: tools_option.clone(),
+            };
+
+            let url = format!("{}/chat/completions", self.config.endpoint);
+
+            let response = self
+                .client
+                .post(&url)
+                .headers(self.build_headers())
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| anyhow!("Request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let error_text = response.text().await?;
+                return Err(anyhow!("API error: {}", error_text));
+            }
+
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                let chunk_str = String::from_utf8_lossy(&chunk);
+                buffer.push_str(&chunk_str);
+
+                while let Some(pos) = buffer.find("\n\n") {
+                    let message = buffer[..pos].to_string();
+                    buffer = buffer[pos + 2..].to_string();
+
+                    if message.starts_with("data: ") {
+                        let data = &message[6..];
+                        if data == "[DONE]" {
+                            break;
+                        }
+
+                        if let Ok(stream_response) = serde_json::from_str::<StreamResponse>(data) {
+                            if let Some(choice) = stream_response.choices.first() {
+                                if let Some(content) = &choice.delta.content {
+                                    full_response.push_str(content);
+                                    on_event(StreamEvent::Text(content.clone()));
+                                }
+
+                                if let Some(delta_tool_calls) = &choice.delta.tool_calls {
+                                    for delta_tc in delta_tool_calls {
+                                        if let Some(id) = &delta_tc.id {
+                                            let name = delta_tc
+                                                .function
+                                                .as_ref()
+                                                .and_then(|f| f.name.clone())
+                                                .unwrap_or_default();
+                                            on_event(StreamEvent::ToolCallStart {
+                                                id: id.clone(),
+                                                name: name.clone(),
+                                            });
+                                            tool_calls.push(ToolCall {
+                                                id: id.clone(),
+                                                tool_type: "function".to_string(),
+                                                function: super::tools::FunctionCall {
+                                                    name,
+                                                    arguments: String::new(),
+                                                },
+                                            });
+                                        }
+
+                                        if let Some(args_delta) = delta_tc
+                                            .function
+                                            .as_ref()
+                                            .and_then(|f| f.arguments.as_ref())
+                                        {
+                                            on_event(StreamEvent::ToolCallDelta(args_delta.clone()));
+                                            if let Some(last_tc) = tool_calls.last_mut() {
+                                                last_tc.function.arguments.push_str(args_delta);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if choice.finish_reason.is_some() {
+                                    on_event(StreamEvent::ToolCallEnd);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if tool_calls.is_empty() {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: if full_response.is_empty() {
+                        None
+                    } else {
+                        Some(full_response.clone())
+                    },
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                break;
+            }
+
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(tool_calls.clone()),
+                tool_call_id: None,
+                name: None,
+            });
+
+            for tc in &tool_calls {
+                let tool_name = &tc.function.name;
+                let tool_args = &tc.function.arguments;
+
+                on_event(StreamEvent::Text(format!("\n[Tool: {}]\n", tool_name)));
+
+                let result = if let Some(ref executor) = self.tool_executor {
+                    executor.execute(tool_name, tool_args).await
+                } else {
+                    Err(anyhow!("Tool not available"))
+                };
+
+                let tool_result = match result {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let mcp = self.mcp_manager.read().await;
+                        if mcp.is_mcp_tool(tool_name) {
+                            mcp.execute_tool(tool_name, tool_args).await?
+                        } else {
+                            "Tool not available. Enable tools in config.".to_string()
+                        }
+                    }
+                };
+
+                on_event(StreamEvent::Text(format!(
+                    "Result: {}\n",
+                    &tool_result[..tool_result.len().min(200)]
+                )));
+
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(tool_result),
+                    tool_calls: None,
+                    tool_call_id: Some(tc.id.clone()),
+                    name: Some(tool_name.clone()),
+                });
+            }
+        }
+
+        on_event(StreamEvent::Done);
+        Ok(full_response)
+    }
+}
+
+impl Default for LlmClient {
+    fn default() -> Self {
+        Self::default_client()
+    }
+}

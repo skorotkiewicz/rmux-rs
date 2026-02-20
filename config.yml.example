@@ -1,0 +1,76 @@
+mode: llm # claude
+endpoint: http://192.168.0.124:8888/v1
+model: default
+api_key: "123"
+temp: 0.7
+system: "You are a helpful assistant."
+workspace: /home/mod/workspace-default
+
+# MCP Servers
+mcp_servers:
+  city:
+    type: remote
+    url: https://mcp.hallucinatingsplines.com/mcp?key=
+    enabled: true
+
+  context7:
+    type: local
+    command: bunx
+    args:
+      - "-y"
+      - "@upstash/context7-mcp"
+      - "--api-key"
+      - "ctx7sk-"
+    env:
+        "GITHUB_TOKEN": "your-github-token-here"
+    enabled: false
+
+  filesystem:
+    type: local
+    command: mcp-server-filesystem
+    args:
+      - "--root"
+      - "/home/user/documents"
+    enabled: false
+
+  github:
+    type: local
+    command: mcp-server-github
+    enabled: false
+
+  git:
+    type: local
+    command: mcp-server-git
+    args:
+      - "--repository"
+      - "/home/user/projects/myproject"
+    enabled: false
+
+# Presets
+presets:
+  mylocal:
+    endpoint: http://192.168.0.124:8888/v1
+    model: local-model
+    api-key: "123"
+    system: "You are a helpful assistant."
+    workspace: /home/mod/Dev/Rust/rmux-rs/workspace
+    mcp: false
+    tools: false
+
+  grok:
+    endpoint: https://openrouter.ai/api/v1
+    model: x-ai/grok-4-fast
+    api-key: "sk-or-v1-"
+    system: "You are a helpful assistant."
+    workspace: /home/mod/Dev/Rust/rmux-rs/workspace
+    mcp: false
+    tools: true
+
+  free:
+    endpoint: https://openrouter.ai/api/v1
+    model: openrouter/free
+    api-key: "sk-or-v1-"
+    system: "You are a helpful assistant."
+    workspace: /home/mod/Dev/Rust/rmux-rs/workspace
+    mcp: true
+    tools: true

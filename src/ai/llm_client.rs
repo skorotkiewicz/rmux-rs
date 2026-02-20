@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -240,8 +240,93 @@ pub enum StreamEvent {
     ToolCallStart { id: String, name: String },
     ToolCallDelta(String),
     ToolCallEnd,
+    ToolExecuting { name: String, arguments: String },
+    ToolResult { name: String, result: String },
     Done,
     Error(String),
+}
+
+fn get_history_path(workspace: &Path) -> PathBuf {
+    workspace.join(".agent").join("HISTORY.log")
+}
+
+fn load_history(workspace: &Path) -> Vec<ChatMessage> {
+    let history_path = get_history_path(workspace);
+    if !history_path.exists() {
+        return Vec::new();
+    }
+
+    if let Ok(content) = std::fs::read_to_string(&history_path) {
+        let mut messages = Vec::new();
+        let parts: Vec<&str> = content.split("--- END ---").collect();
+
+        for part in parts {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            if let Some(content) = part.strip_prefix("--- USER ---") {
+                let content = content.trim();
+                if !content.is_empty() {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(content.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+            } else if let Some(content) = part.strip_prefix("--- ASSISTANT ---") {
+                let content = content.trim();
+                if !content.is_empty() {
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(content.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+            }
+        }
+
+        if !messages.is_empty() {
+            eprintln!("[rmux] Loaded {} messages from history", messages.len());
+        }
+        messages
+    } else {
+        Vec::new()
+    }
+}
+
+fn save_history(workspace: &Path, messages: &[ChatMessage]) {
+    let history_path = get_history_path(workspace);
+
+    if let Some(parent) = history_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut content = String::new();
+    for msg in messages {
+        match msg.role.as_str() {
+            "user" => {
+                content.push_str(&format!(
+                    "--- USER ---\n{}\n--- END ---\n\n",
+                    msg.content.as_deref().unwrap_or("")
+                ));
+            }
+            "assistant" => {
+                content.push_str(&format!(
+                    "--- ASSISTANT ---\n{}\n--- END ---\n\n",
+                    msg.content.as_deref().unwrap_or("")
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let _ = std::fs::write(&history_path, content);
 }
 
 pub struct LlmClient {
@@ -314,13 +399,11 @@ impl LlmClient {
     pub async fn initialize(&self) -> Result<()> {
         let mut tools = self.tools.write().await;
 
-        // Add built-in tools only if enabled and workspace is configured
         if self.config.tools && self.tool_executor.is_some() {
             tools.extend(ToolExecutor::get_tools());
             eprintln!("[rmux] File tools enabled (sandboxed to workspace)");
         }
 
-        // Load MCP servers only if enabled
         if self.config.mcp && !self.config.mcp_servers.is_empty() {
             let mcp_config = super::mcp::McpConfig {
                 mcp_servers: self.config.mcp_servers.clone(),
@@ -329,8 +412,8 @@ impl LlmClient {
             manager.load_from_config(&mcp_config).await?;
             tools.extend(manager.get_all_tools());
         }
+        drop(tools);
 
-        // Add system message to start of conversation
         let mut messages = self.conversations.write().await;
         if messages.is_empty() {
             messages.push(ChatMessage {
@@ -340,6 +423,11 @@ impl LlmClient {
                 tool_call_id: None,
                 name: None,
             });
+
+            if let Some(ref workspace) = self.config.workspace {
+                let history = load_history(workspace);
+                messages.extend(history);
+            }
         }
 
         Ok(())
@@ -364,6 +452,13 @@ impl LlmClient {
 
     pub async fn get_conversation(&self) -> Vec<ChatMessage> {
         self.conversations.read().await.clone()
+    }
+
+    pub async fn save_conversation(&self) {
+        if let Some(ref workspace) = self.config.workspace {
+            let messages = self.conversations.read().await;
+            save_history(workspace, &messages);
+        }
     }
 
     fn build_headers(&self) -> reqwest::header::HeaderMap {
@@ -527,7 +622,10 @@ impl LlmClient {
                 let tool_name = &tc.function.name;
                 let tool_args = &tc.function.arguments;
 
-                on_event(StreamEvent::Text(format!("\n[Tool: {}]\n", tool_name)));
+                on_event(StreamEvent::ToolExecuting {
+                    name: tool_name.clone(),
+                    arguments: tool_args.clone(),
+                });
 
                 let result = if let Some(ref executor) = self.tool_executor {
                     executor.execute(tool_name, tool_args).await
@@ -547,10 +645,10 @@ impl LlmClient {
                     }
                 };
 
-                on_event(StreamEvent::Text(format!(
-                    "Result: {}\n",
-                    &tool_result[..tool_result.len().min(200)]
-                )));
+                on_event(StreamEvent::ToolResult {
+                    name: tool_name.clone(),
+                    result: tool_result.clone(),
+                });
 
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
@@ -560,6 +658,13 @@ impl LlmClient {
                     name: Some(tool_name.clone()),
                 });
             }
+        }
+
+        drop(messages);
+
+        if let Some(ref workspace) = self.config.workspace {
+            let msgs = self.conversations.read().await;
+            save_history(workspace, &msgs);
         }
 
         on_event(StreamEvent::Done);

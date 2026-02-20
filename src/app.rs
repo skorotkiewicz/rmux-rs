@@ -1,6 +1,6 @@
 use crate::ai::llm_client::LlmClient;
 use crate::notification::NotificationStore;
-use crate::terminal::TerminalPane;
+use crate::terminal::{TerminalPane, TerminalState};
 use crate::workspace::Workspace;
 use eframe::egui;
 use egui_dock::{tab_viewer::OnCloseResponse, DockArea, DockState, TabViewer};
@@ -9,10 +9,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct RmuxApp {
-    dock_state: DockState<Tab>,
+    dock_states: HashMap<Uuid, DockState<Tab>>,
+    current_workspace: Option<Uuid>,
     workspaces: HashMap<Uuid, Workspace>,
     workspace_order: Vec<Uuid>,
-    selected_workspace: Option<Uuid>,
     notifications: NotificationStore,
     sidebar_width: f32,
     show_sidebar: bool,
@@ -21,13 +21,14 @@ pub struct RmuxApp {
     selected_preset: Option<String>,
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Tab {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub title: String,
     pub pane_type: PaneType,
     pub has_notification: bool,
+    pub terminal_state: TerminalState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -44,6 +45,7 @@ impl Tab {
             title,
             pane_type,
             has_notification: false,
+            terminal_state: TerminalState::default(),
         }
     }
 }
@@ -59,6 +61,9 @@ impl RmuxApp {
         let tab = Tab::new(workspace_id, "Terminal 1".to_string(), PaneType::Terminal);
         let dock_state = DockState::new(vec![tab]);
 
+        let mut dock_states = HashMap::new();
+        dock_states.insert(workspace_id, dock_state);
+
         let presets = Self::load_presets();
         let llm_client = Arc::new(LlmClient::default_client());
 
@@ -70,10 +75,10 @@ impl RmuxApp {
         });
 
         Self {
-            dock_state,
+            dock_states,
+            current_workspace: Some(workspace_id),
             workspaces,
             workspace_order: vec![workspace_id],
-            selected_workspace: Some(workspace_id),
             notifications: NotificationStore::new(),
             sidebar_width: 200.0,
             show_sidebar: true,
@@ -112,13 +117,18 @@ impl RmuxApp {
     }
 
     fn count_tabs(&self) -> usize {
-        let mut count = 0;
-        for (_surface, node) in self.dock_state.iter_all_nodes() {
-            if let Some(tabs) = node.tabs() {
-                count += tabs.len();
+        if let Some(workspace_id) = self.current_workspace {
+            if let Some(dock_state) = self.dock_states.get(&workspace_id) {
+                let mut count = 0;
+                for (_surface, node) in dock_state.iter_all_nodes() {
+                    if let Some(tabs) = node.tabs() {
+                        count += tabs.len();
+                    }
+                }
+                return count;
             }
         }
-        count
+        0
     }
 
     fn add_workspace(&mut self) {
@@ -131,43 +141,47 @@ impl RmuxApp {
 
         self.workspaces.insert(id, workspace);
         self.workspace_order.push(id);
-        self.selected_workspace = Some(id);
-        self.dock_state = new_dock;
+        self.dock_states.insert(id, new_dock);
+        self.current_workspace = Some(id);
     }
 
     fn add_terminal(&mut self) {
-        if let Some(workspace_id) = self.selected_workspace {
+        if let Some(workspace_id) = self.current_workspace {
             let num = self.count_tabs() + 1;
-            let tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
-            self.dock_state.push_to_focused_leaf(tab);
+            if let Some(dock_state) = self.dock_states.get_mut(&workspace_id) {
+                let tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
+                dock_state.push_to_focused_leaf(tab);
+            }
         }
     }
 
     fn split_right(&mut self) {
-        if let Some(workspace_id) = self.selected_workspace {
-            if let Some((surface, node)) = self.dock_state.focused_leaf() {
-                let num = self.count_tabs() + 1;
-                let new_tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
-                self.dock_state[surface].split_tabs(node, egui_dock::Split::Right, 0.5, vec![new_tab]);
+        if let Some(workspace_id) = self.current_workspace {
+            let num = self.count_tabs() + 1;
+            if let Some(dock_state) = self.dock_states.get_mut(&workspace_id) {
+                if let Some((surface, node)) = dock_state.focused_leaf() {
+                    let new_tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
+                    dock_state[surface].split_tabs(node, egui_dock::Split::Right, 0.5, vec![new_tab]);
+                }
             }
         }
     }
 
     fn split_down(&mut self) {
-        if let Some(workspace_id) = self.selected_workspace {
-            if let Some((surface, node)) = self.dock_state.focused_leaf() {
-                let num = self.count_tabs() + 1;
-                let new_tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
-                self.dock_state[surface].split_tabs(node, egui_dock::Split::Below, 0.5, vec![new_tab]);
+        if let Some(workspace_id) = self.current_workspace {
+            let num = self.count_tabs() + 1;
+            if let Some(dock_state) = self.dock_states.get_mut(&workspace_id) {
+                if let Some((surface, node)) = dock_state.focused_leaf() {
+                    let new_tab = Tab::new(workspace_id, format!("Terminal {}", num), PaneType::Terminal);
+                    dock_state[surface].split_tabs(node, egui_dock::Split::Below, 0.5, vec![new_tab]);
+                }
             }
         }
     }
 
     fn select_workspace(&mut self, id: Uuid) {
         if self.workspaces.contains_key(&id) {
-            self.selected_workspace = Some(id);
-            let tab = Tab::new(id, "Terminal 1".to_string(), PaneType::Terminal);
-            self.dock_state = DockState::new(vec![tab]);
+            self.current_workspace = Some(id);
         }
     }
 
@@ -177,10 +191,12 @@ impl RmuxApp {
 
     fn clear_all_notifications(&mut self) {
         self.notifications.clear_all();
-        for (_surface, node) in self.dock_state.iter_all_nodes_mut() {
-            if let Some(tabs) = node.tabs_mut() {
-                for tab in tabs {
-                    tab.has_notification = false;
+        for dock_state in self.dock_states.values_mut() {
+            for (_surface, node) in dock_state.iter_all_nodes_mut() {
+                if let Some(tabs) = node.tabs_mut() {
+                    for tab in tabs {
+                        tab.has_notification = false;
+                    }
                 }
             }
         }
@@ -216,7 +232,7 @@ impl RmuxApp {
             let workspace_ids: Vec<Uuid> = self.workspace_order.clone();
             for id in workspace_ids {
                 if let Some(workspace) = self.workspaces.get(&id) {
-                    let is_selected = self.selected_workspace == Some(id);
+                    let is_selected = self.current_workspace == Some(id);
                     let has_notifications = self.notifications.has_unread_for_workspace(id);
 
                     let text = if has_notifications {
@@ -279,13 +295,17 @@ impl eframe::App for RmuxApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            DockArea::new(&mut self.dock_state).show_inside(
-                ui,
-                &mut TabViewerImpl {
-                    notifications: &mut self.notifications,
-                    llm_client: self.llm_client.clone(),
-                },
-            );
+            if let Some(workspace_id) = self.current_workspace {
+                if let Some(dock_state) = self.dock_states.get_mut(&workspace_id) {
+                    DockArea::new(dock_state).show_inside(
+                        ui,
+                        &mut TabViewerImpl {
+                            notifications: &mut self.notifications,
+                            llm_client: self.llm_client.clone(),
+                        },
+                    );
+                }
+            }
         });
     }
 }

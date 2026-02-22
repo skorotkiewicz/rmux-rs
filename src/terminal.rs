@@ -312,16 +312,16 @@ impl TerminalPane {
                 });
 
                 ui.horizontal(|ui| {
-                    // ui.label(
-                    //     egui::RichText::new(">")
-                    //         .font(egui::FontId::monospace(13.0))
-                    //         .color(Color32::from_rgb(100, 255, 100)),
-                    // );
+                    ui.label(
+                        egui::RichText::new(">")
+                            .font(egui::FontId::monospace(13.0))
+                            .color(Color32::from_rgb(100, 255, 100)),
+                    );
 
                     let response = ui.add(
                         TextEdit::multiline(&mut tab.terminal_state.input)
                             .desired_width(ui.available_width() - 60.0)
-                            .desired_rows(2)
+                            .desired_rows(1)
                             .font(egui::FontId::monospace(13.0))
                             .text_color(Color32::from_rgb(220, 220, 220))
                             .lock_focus(true),

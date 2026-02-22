@@ -252,6 +252,50 @@ impl RmuxApp {
         self.show_sidebar = !self.show_sidebar;
     }
 
+    fn check_pending_notifications(&mut self) {
+        let current_workspace = self.current_workspace;
+        
+        for (workspace_id, dock_state) in self.dock_states.iter_mut() {
+            let is_current_workspace = current_workspace == Some(*workspace_id);
+            let focused_tab_id = dock_state.find_active_focused().map(|(_, t)| t.id);
+            
+            for (_surface, node) in dock_state.iter_all_nodes_mut() {
+                if let Some(tabs) = node.tabs_mut() {
+                    for tab in tabs {
+                        if let Some(ref pending) = tab.terminal_state.pending {
+                            if pending.should_notify() {
+                                let is_current_tab = is_current_workspace && focused_tab_id == Some(tab.id);
+                                
+                                if !is_current_tab {
+                                    if let Some(content) = pending.get_assistant_content() {
+                                        self.notifications.add_notification(
+                                            tab.workspace_id,
+                                            tab.id,
+                                            "AI Response",
+                                            "AI replied",
+                                            content.chars().take(100).collect::<String>(),
+                                        );
+                                        tab.has_notification = true;
+                                    } else if let Some(err) = pending.get_error() {
+                                        self.notifications.add_notification(
+                                            tab.workspace_id,
+                                            tab.id,
+                                            "Error",
+                                            "AI encountered an error",
+                                            err.chars().take(100).collect::<String>(),
+                                        );
+                                        tab.has_notification = true;
+                                    }
+                                }
+                                pending.mark_notified();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn clear_all_notifications(&mut self) {
         self.notifications.mark_all_read();
         for dock_state in self.dock_states.values_mut() {
@@ -598,6 +642,8 @@ impl RmuxApp {
 
 impl eframe::App for RmuxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.check_pending_notifications();
+        
         if self.show_sidebar {
             egui::SidePanel::left("sidebar")
                 .default_width(self.sidebar_width)
@@ -656,10 +702,12 @@ impl eframe::App for RmuxApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(workspace_id) = self.current_workspace {
                 if let Some(dock_state) = self.dock_states.get_mut(&workspace_id) {
+                    let focused_tab_id = dock_state.find_active_focused().map(|(_, tab)| tab.id);
                     DockArea::new(dock_state).show_inside(
                         ui,
                         &mut TabViewerImpl {
                             notifications: &mut self.notifications,
+                            focused_tab_id,
                         },
                     );
                 }
@@ -670,6 +718,7 @@ impl eframe::App for RmuxApp {
 
 struct TabViewerImpl<'a> {
     notifications: &'a mut NotificationStore,
+    focused_tab_id: Option<Uuid>,
 }
 
 impl TabViewer for TabViewerImpl<'_> {
@@ -689,9 +738,10 @@ impl TabViewer for TabViewerImpl<'_> {
             self.notifications.mark_read_for_tab(tab.id);
             tab.has_notification = false;
         }
+        let is_focused = self.focused_tab_id == Some(tab.id);
         match tab.pane_type {
             PaneType::Terminal => {
-                TerminalPane::show(ui, tab, self.notifications, tab.llm_client.clone());
+                TerminalPane::show(ui, tab, self.notifications, tab.llm_client.clone(), is_focused);
             }
             PaneType::Browser => {
                 ui.vertical(|ui| {

@@ -3,4 +3,5 @@
 /cmux
 config.yml
 /workspace
+/workspace*
 /undead

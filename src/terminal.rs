@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 pub struct TerminalPane;
 
 #[derive(Clone, Debug)]
-enum UiEvent {
+pub enum UiEvent {
     Text(String),
     ToolCall {
         id: String,
@@ -29,20 +29,64 @@ enum UiEvent {
 }
 
 #[derive(Clone)]
-struct PendingResponse {
-    ready: Arc<AtomicBool>,
-    conversation: Arc<RwLock<Vec<ChatMessage>>>,
-    events: Arc<RwLock<Vec<UiEvent>>>,
-    error: Arc<RwLock<Option<String>>>,
+pub struct PendingResponse {
+    pub ready: Arc<AtomicBool>,
+    pub conversation: Arc<RwLock<Vec<ChatMessage>>>,
+    pub events: Arc<RwLock<Vec<UiEvent>>>,
+    pub error: Arc<RwLock<Option<String>>>,
+    pub notified: Arc<AtomicBool>,
+}
+
+impl PendingResponse {
+    pub fn new() -> Self {
+        Self {
+            ready: Arc::new(AtomicBool::new(false)),
+            conversation: Arc::new(RwLock::new(Vec::new())),
+            events: Arc::new(RwLock::new(Vec::new())),
+            error: Arc::new(RwLock::new(None)),
+            notified: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
+    
+    pub fn should_notify(&self) -> bool {
+        self.is_ready() && !self.notified.load(Ordering::Relaxed)
+    }
+    
+    pub fn mark_notified(&self) {
+        self.notified.store(true, Ordering::Relaxed);
+    }
+    
+    pub fn get_assistant_content(&self) -> Option<String> {
+        if let Ok(conv) = self.conversation.read() {
+            for msg in conv.iter().rev() {
+                if msg.role == "assistant" {
+                    if let Some(c) = &msg.content {
+                        if !c.is_empty() {
+                            return Some(c.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    
+    pub fn get_error(&self) -> Option<String> {
+        self.error.read().ok().and_then(|e| e.clone())
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct TerminalState {
     pub messages: Vec<TerminalMessage>,
     pub input: String,
-    pending: Option<PendingResponse>,
-    history_loaded: bool,
-    show_clear_confirm: bool,
+    pub pending: Option<PendingResponse>,
+    pub history_loaded: bool,
+    pub show_clear_confirm: bool,
 }
 
 #[derive(Clone)]
@@ -68,6 +112,7 @@ impl TerminalPane {
         tab: &mut Tab,
         notifications: &mut NotificationStore,
         llm_client: Arc<LlmClient>,
+        _is_focused: bool,
     ) {
         ui.horizontal(|ui| {
             if ui.small_button("🗑").clicked() {
@@ -269,37 +314,13 @@ impl TerminalPane {
                     }
 
                     if pending.ready.load(Ordering::Relaxed) {
-                        if let Ok(conv) = pending.conversation.read() {
-                            if let Ok(error) = pending.error.read() {
-                                if let Some(err) = error.as_ref() {
-                                    tab.terminal_state
-                                        .messages
-                                        .push(TerminalMessage::Error(err.clone()));
-                                } else {
-                                    let mut assistant_content = String::new();
-                                    for msg in conv.iter() {
-                                        if msg.role == "assistant" {
-                                            if let Some(c) = &msg.content {
-                                                if !c.is_empty() {
-                                                    assistant_content = c.clone();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !assistant_content.is_empty() {
-                                        notifications.add_notification(
-                                            tab.workspace_id,
-                                            tab.id,
-                                            "AI Response",
-                                            "AI replied",
-                                            assistant_content.chars().take(100).collect::<String>(),
-                                        );
-                                        tab.has_notification = true;
-                                    }
-                                }
+                        if let Ok(error) = pending.error.read() {
+                            if let Some(err) = error.as_ref() {
+                                tab.terminal_state
+                                    .messages
+                                    .push(TerminalMessage::Error(err.clone()));
                             }
                         }
-
                         tab.terminal_state.pending = None;
                     } else {
                         ui.horizontal(|ui| {
@@ -338,12 +359,7 @@ impl TerminalPane {
                                 .push(TerminalMessage::User(user_msg.clone()));
                             tab.terminal_state.input.clear();
 
-                            let pending = PendingResponse {
-                                ready: Arc::new(AtomicBool::new(false)),
-                                conversation: Arc::new(RwLock::new(Vec::new())),
-                                events: Arc::new(RwLock::new(Vec::new())),
-                                error: Arc::new(RwLock::new(None)),
-                            };
+                            let pending = PendingResponse::new();
 
                             let ready = pending.ready.clone();
                             let conversation_arc = pending.conversation.clone();

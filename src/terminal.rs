@@ -1,6 +1,7 @@
 use crate::ai::llm_client::{ChatMessage, LlmClient, StreamEvent};
 use crate::app::Tab;
 use eframe::egui::{self, Color32, TextEdit};
+use egui_phosphor::regular;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -112,7 +113,7 @@ impl TerminalPane {
         llm_client: Arc<LlmClient>,
     ) {
         ui.horizontal(|ui| {
-            if ui.small_button("🗑").clicked() {
+            if ui.small_button(regular::TRASH).clicked() {
                 tab.terminal_state.show_clear_confirm = !tab.terminal_state.show_clear_confirm;
             }
             if tab.terminal_state.show_clear_confirm {

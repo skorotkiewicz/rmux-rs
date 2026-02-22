@@ -4,6 +4,7 @@ use crate::terminal::{TerminalPane, TerminalState};
 use crate::workspace::Workspace;
 use eframe::egui;
 use egui_dock::{DockArea, DockState, TabViewer, tab_viewer::OnCloseResponse};
+use egui_phosphor::regular;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -76,7 +77,11 @@ impl Tab {
 }
 
 impl RmuxApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        cc.egui_ctx.set_fonts(fonts);
+
         let workspace_id = Uuid::new_v4();
         let workspace = Workspace::new(workspace_id, "Workspace 1".to_string());
 
@@ -405,7 +410,7 @@ impl RmuxApp {
                         }
                         if let Some(ref branch) = workspace.git_branch {
                             ui.label(
-                                egui::RichText::new(format!("🌿 {}", branch))
+                                egui::RichText::new(format!("{} {}", regular::GIT_BRANCH, branch))
                                     .small()
                                     .color(egui::Color32::from_rgb(100, 200, 100)),
                             );
@@ -437,7 +442,7 @@ impl RmuxApp {
                                 .corner_radius(egui::CornerRadius::same(2))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("✓").clicked() {
+                                        if ui.small_button(regular::CHECK).clicked() {
                                             self.notifications.mark_read(notif_id);
                                         }
                                         ui.vertical(|ui| {
@@ -482,7 +487,7 @@ impl RmuxApp {
             }
 
             ui.separator();
-            if ui.button("+ New Workspace").clicked() {
+            if ui.button(format!("{} New Workspace", regular::FOLDER_PLUS)).clicked() {
                 self.add_workspace();
             }
 
@@ -542,15 +547,25 @@ impl RmuxApp {
                                     );
                                 } else {
                                     for (name, running) in mcp_status {
-                                        let status = if running { "🟢" } else { "🔴" };
+                                        let status = if running {
+                                            regular::CHECK_CIRCLE
+                                        } else {
+                                            regular::X_CIRCLE
+                                        };
+                                        let status_color = if running {
+                                            egui::Color32::from_rgb(100, 200, 100)
+                                        } else {
+                                            egui::Color32::from_rgb(200, 100, 100)
+                                        };
                                         ui.horizontal(|ui| {
                                             ui.label(
                                                 egui::RichText::new(format!("{} {}", status, name))
-                                                    .small(),
+                                                    .small()
+                                                    .color(status_color),
                                             );
                                             let client = tab.llm_client.clone();
                                             let name_clone = name.clone();
-                                            if ui.small_button("✕").clicked() {
+                                            if ui.small_button(regular::X).clicked() {
                                                 rt.block_on(async {
                                                     client.disconnect_mcp(&name_clone).await;
                                                 });
@@ -567,7 +582,7 @@ impl RmuxApp {
 
             ui.add_space(10.0);
             ui.separator();
-            if ui.button("📋 All Notifications").clicked() {
+            if ui.button(format!("{} All Notifications", regular::CLIPBOARD_TEXT)).clicked() {
                 self.show_notifications = !self.show_notifications;
             }
         });
@@ -617,7 +632,7 @@ impl RmuxApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if !read {
-                                    if ui.small_button("✓").clicked() {
+                                    if ui.small_button(regular::CHECK).clicked() {
                                         self.notifications.mark_read(notif_id);
                                     }
                                 }
@@ -634,7 +649,7 @@ impl RmuxApp {
                 }
 
                 ui.separator();
-                if ui.button("Mark All Read").clicked() {
+                if ui.button(format!("{} Mark All Read", regular::CHECKS)).clicked() {
                     self.notifications.mark_all_read();
                     for dock_state in self.dock_states.values_mut() {
                         for (_surface, node) in dock_state.iter_all_nodes_mut() {
@@ -646,7 +661,7 @@ impl RmuxApp {
                         }
                     }
                 }
-                if ui.button("Clear All").clicked() {
+                if ui.button(format!("{} Clear All", regular::TRASH)).clicked() {
                     self.notifications.clear_all();
                 }
             }
@@ -678,37 +693,34 @@ impl eframe::App for RmuxApp {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("☰").clicked() {
+                if ui.button(regular::LIST).clicked() {
                     self.toggle_sidebar();
                 }
                 ui.separator();
-                if ui.button("+ Terminal").clicked() {
+                if ui.button(format!("{} Terminal", regular::PLUS)).clicked() {
                     self.add_terminal();
                 }
-                if ui.button("+ Browser").clicked() {
+                if ui.button(format!("{} Browser", regular::GLOBE)).clicked() {
                     self.add_browser();
                 }
-                if ui.button("Split →").clicked() {
+                if ui.button(format!("Split {}", regular::ARROW_RIGHT)).clicked() {
                     self.split_right();
                 }
-                if ui.button("Split ↓").clicked() {
+                if ui.button(format!("Split {}", regular::ARROW_DOWN)).clicked() {
                     self.split_down();
                 }
                 ui.separator();
-                if ui.button("Clear Notifications").clicked() {
+                if ui.button(format!("{} Clear Notifications", regular::TRASH)).clicked() {
                     self.clear_all_notifications();
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let unread = self.notifications.get_unread_count();
                     if unread > 0 {
-                        if ui.button(format!("🔔 {}", unread)).clicked() {
+                        if ui.button(format!("{} {}", regular::BELL, unread)).clicked() {
                             self.show_notifications = !self.show_notifications;
                         }
                     }
-                    // if let Some(ref preset) = self.selected_preset {
-                    //     ui.label(egui::RichText::new(format!("Preset: {}", preset)).weak());
-                    // }
                 });
             });
         });
@@ -738,7 +750,7 @@ impl TabViewer for TabViewerImpl<'_> {
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         let has_unread = self.notifications.has_unread_for_tab(tab.id);
         if has_unread || tab.has_notification {
-            format!("🔔 {}", tab.title).into()
+            format!("{} {}", regular::BELL, tab.title).into()
         } else {
             tab.title.clone().into()
         }

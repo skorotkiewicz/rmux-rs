@@ -1,18 +1,13 @@
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Workspace {
-    pub id: Uuid,
     pub name: String,
     pub working_directory: Option<String>,
     pub git_branch: Option<String>,
 }
 
 impl Workspace {
-    pub fn new(id: Uuid, name: String) -> Self {
+    pub fn new(name: String) -> Self {
         Self {
-            id,
             name,
             working_directory: None,
             git_branch: None,

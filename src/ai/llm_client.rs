@@ -137,38 +137,18 @@ impl Config {
 
         if let Some(preset_name) = preset {
             if let Some(preset_config) = file.presets.get(preset_name) {
-                if preset_config.mode.is_some() {
-                    base.mode = preset_config.mode.clone();
-                }
-                if preset_config.endpoint.is_some() {
-                    base.endpoint = preset_config.endpoint.clone();
-                }
-                if preset_config.model.is_some() {
-                    base.model = preset_config.model.clone();
-                }
-                if preset_config.api_key.is_some() {
-                    base.api_key = preset_config.api_key.clone();
-                }
-                if preset_config.system.is_some() {
-                    base.system = preset_config.system.clone();
-                }
-                if preset_config.temp.is_some() {
-                    base.temp = preset_config.temp;
-                }
-                if preset_config.max_tokens.is_some() {
-                    base.max_tokens = preset_config.max_tokens;
-                }
+                base.mode = preset_config.mode.clone().or(base.mode);
+                base.endpoint = preset_config.endpoint.clone().or(base.endpoint);
+                base.model = preset_config.model.clone().or(base.model);
+                base.api_key = preset_config.api_key.clone().or(base.api_key);
+                base.system = preset_config.system.clone().or(base.system);
+                base.temp = preset_config.temp.or(base.temp);
+                base.max_tokens = preset_config.max_tokens.or(base.max_tokens);
+                base.workspace = preset_config.workspace.clone().or(base.workspace);
+                base.mcp = preset_config.mcp.or(base.mcp);
+                base.tools = preset_config.tools.or(base.tools);
                 if !preset_config.mcp_servers.is_empty() {
                     base.mcp_servers = preset_config.mcp_servers.clone();
-                }
-                if preset_config.workspace.is_some() {
-                    base.workspace = preset_config.workspace.clone();
-                }
-                if preset_config.mcp.is_some() {
-                    base.mcp = preset_config.mcp;
-                }
-                if preset_config.tools.is_some() {
-                    base.tools = preset_config.tools;
                 }
             } else {
                 eprintln!("[rmux] Preset '{}' not found", preset_name);
@@ -236,11 +216,8 @@ struct DeltaFunction {
 
 pub enum StreamEvent {
     Text(String),
-    ToolCallStart {
-        id: String,
-        name: String,
-    },
-    ToolCallDelta(String),
+    ToolCallStart,
+    ToolCallDelta,
     ToolCallEnd,
     ToolExecuting {
         name: String,
@@ -346,6 +323,7 @@ pub struct LlmClient {
     tool_executor: Option<ToolExecutor>,
     mcp_manager: Arc<RwLock<McpManager>>,
     agent_context: Option<AgentContext>,
+    cached_headers: reqwest::header::HeaderMap,
 }
 
 impl LlmClient {
@@ -361,6 +339,18 @@ impl LlmClient {
 
         let agent_context = config.workspace.as_ref().map(|ws| AgentContext::load(ws));
 
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        if let Some(ref api_key) = config.api_key {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", api_key).parse().unwrap(),
+            );
+        }
+
         Self {
             client: Client::new(),
             config,
@@ -369,19 +359,16 @@ impl LlmClient {
             tool_executor,
             mcp_manager: Arc::new(RwLock::new(McpManager::new())),
             agent_context,
+            cached_headers: headers,
         }
     }
 
-    pub fn from_config(config: Config) -> Self {
-        Self::new(config)
-    }
-
     pub fn default_client() -> Self {
-        Self::from_config(Config::load())
+        Self::new(Config::load())
     }
 
     pub fn with_preset(preset: &str) -> Self {
-        Self::from_config(Config::load_with_preset(Some(preset)))
+        Self::new(Config::load_with_preset(Some(preset)))
     }
 
     pub fn get_workspace(&self) -> Option<&PathBuf> {
@@ -462,8 +449,8 @@ impl LlmClient {
         });
     }
 
-    pub async fn get_conversation(&self) -> Vec<ChatMessage> {
-        self.conversations.read().await.clone()
+    pub fn get_conversation(&self) -> Option<Vec<ChatMessage>> {
+        self.conversations.try_read().ok().map(|g| g.clone())
     }
 
     pub async fn save_conversation(&self) {
@@ -473,9 +460,8 @@ impl LlmClient {
         }
     }
 
-    pub async fn get_mcp_status(&self) -> Vec<(String, bool)> {
-        let mcp = self.mcp_manager.read().await;
-        mcp.connection_status()
+    pub fn get_mcp_status(&self) -> Option<Vec<(String, bool)>> {
+        self.mcp_manager.try_read().ok().map(|mcp| mcp.connection_status())
     }
 
     pub async fn disconnect_mcp(&self, server_name: &str) -> bool {
@@ -483,19 +469,71 @@ impl LlmClient {
         mcp.disconnect_server(server_name)
     }
 
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
-        );
-        if let Some(ref api_key) = self.config.api_key {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", api_key).parse().unwrap(),
-            );
+    fn process_stream_data<F>(
+        data: &str,
+        full_response: &mut String,
+        tool_calls: &mut Vec<ToolCall>,
+        on_event: &mut F,
+    ) where
+        F: FnMut(StreamEvent) + Send,
+    {
+        if let Ok(stream_response) = serde_json::from_str::<StreamResponse>(data) {
+            if let Some(choice) = stream_response.choices.first() {
+                if let Some(content) = &choice.delta.content {
+                    full_response.push_str(content);
+                    on_event(StreamEvent::Text(content.clone()));
+                }
+
+                if let Some(delta_tool_calls) = &choice.delta.tool_calls {
+                    for delta_tc in delta_tool_calls {
+                        if let Some(id) = &delta_tc.id {
+                            let name = delta_tc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.clone())
+                                .unwrap_or_default();
+                            let tool_type = delta_tc
+                                .tool_type
+                                .clone()
+                                .unwrap_or_else(|| "function".to_string());
+                            on_event(StreamEvent::ToolCallStart);
+                            tool_calls.push(ToolCall {
+                                id: id.clone(),
+                                tool_type,
+                                function: super::tools::FunctionCall {
+                                    name,
+                                    arguments: String::new(),
+                                },
+                            });
+                        }
+
+                        if let Some(args_delta) = delta_tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.arguments.as_ref())
+                        {
+                            on_event(StreamEvent::ToolCallDelta);
+                            if let Some(last_tc) = tool_calls.last_mut() {
+                                last_tc.function.arguments.push_str(args_delta);
+                            }
+                        }
+                    }
+                }
+
+                if choice.finish_reason.is_some() && !tool_calls.is_empty() {
+                    on_event(StreamEvent::ToolCallEnd);
+                }
+            }
+        } else if !data.is_empty() {
+            on_event(StreamEvent::Error(format!(
+                "Failed to parse stream: {}",
+                data
+            )));
         }
-        headers
+    }
+
+    fn build_headers(&self) -> &reqwest::header::HeaderMap {
+        &self.cached_headers
     }
 
     pub async fn send_message_stream<F>(
@@ -506,15 +544,17 @@ impl LlmClient {
     where
         F: FnMut(StreamEvent) + Send,
     {
-        let mut messages = self.conversations.write().await;
-
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: Some(user_message.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        });
+        // Push user message with a brief lock
+        {
+            let mut messages = self.conversations.write().await;
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(user_message.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
 
         let mut full_response = String::new();
         let tools_guard = self.tools.read().await;
@@ -526,9 +566,14 @@ impl LlmClient {
         drop(tools_guard);
 
         loop {
+            let messages_snapshot = {
+                let messages = self.conversations.read().await;
+                messages.clone()
+            };
+
             let request = ChatRequest {
                 model: self.config.model.clone(),
-                messages: messages.clone(),
+                messages: messages_snapshot,
                 temperature: self.config.temp,
                 max_tokens: self.config.max_tokens,
                 stream: true,
@@ -540,7 +585,7 @@ impl LlmClient {
             let response = self
                 .client
                 .post(&url)
-                .headers(self.build_headers())
+                .headers(self.build_headers().clone())
                 .json(&request)
                 .send()
                 .await
@@ -560,77 +605,32 @@ impl LlmClient {
                 let chunk_str = String::from_utf8_lossy(&chunk);
                 buffer.push_str(&chunk_str);
 
-                while let Some(pos) = buffer.find("\n\n") {
-                    let message = buffer[..pos].to_string();
-                    buffer = buffer[pos + 2..].to_string();
+                // Parse SSE: split by line, accumulate data lines, emit on blank
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim_end().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
 
-                    if message.starts_with("data: ") {
-                        let data = &message[6..];
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
                             break;
                         }
 
-                        if let Ok(stream_response) = serde_json::from_str::<StreamResponse>(data) {
-                            if let Some(choice) = stream_response.choices.first() {
-                                if let Some(content) = &choice.delta.content {
-                                    full_response.push_str(content);
-                                    on_event(StreamEvent::Text(content.clone()));
-                                }
-
-                                if let Some(delta_tool_calls) = &choice.delta.tool_calls {
-                                    for delta_tc in delta_tool_calls {
-                                        if let Some(id) = &delta_tc.id {
-                                            let name = delta_tc
-                                                .function
-                                                .as_ref()
-                                                .and_then(|f| f.name.clone())
-                                                .unwrap_or_default();
-                                            let tool_type = delta_tc
-                                                .tool_type
-                                                .clone()
-                                                .unwrap_or_else(|| "function".to_string());
-                                            on_event(StreamEvent::ToolCallStart {
-                                                id: id.clone(),
-                                                name: name.clone(),
-                                            });
-                                            tool_calls.push(ToolCall {
-                                                id: id.clone(),
-                                                tool_type,
-                                                function: super::tools::FunctionCall {
-                                                    name,
-                                                    arguments: String::new(),
-                                                },
-                                            });
-                                        }
-
-                                        if let Some(args_delta) = delta_tc
-                                            .function
-                                            .as_ref()
-                                            .and_then(|f| f.arguments.as_ref())
-                                        {
-                                            on_event(StreamEvent::ToolCallDelta(
-                                                args_delta.clone(),
-                                            ));
-                                            if let Some(last_tc) = tool_calls.last_mut() {
-                                                last_tc.function.arguments.push_str(args_delta);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if choice.finish_reason.is_some() {
-                                    on_event(StreamEvent::ToolCallEnd);
-                                }
-                            }
-                        } else if !data.is_empty() {
-                            on_event(StreamEvent::Error(format!(
-                                "Failed to parse stream: {}",
-                                data
-                            )));
-                        }
+                        Self::process_stream_data(
+                            data,
+                            &mut full_response,
+                            &mut tool_calls,
+                            &mut on_event,
+                        );
                     }
                 }
             }
+
+            // Acquire lock briefly to push results
+            let mut messages = self.conversations.write().await;
 
             if tool_calls.is_empty() {
                 messages.push(ChatMessage {
@@ -644,6 +644,7 @@ impl LlmClient {
                     tool_call_id: None,
                     name: None,
                 });
+                drop(messages);
                 break;
             }
 
@@ -654,6 +655,7 @@ impl LlmClient {
                 tool_call_id: None,
                 name: None,
             });
+            drop(messages);
 
             for tc in &tool_calls {
                 let tool_name = &tc.function.name;
@@ -664,21 +666,32 @@ impl LlmClient {
                     arguments: tool_args.clone(),
                 });
 
-                let result = if let Some(ref executor) = self.tool_executor {
-                    executor.execute(tool_name, tool_args).await
-                } else {
-                    Err(anyhow!("Tool not available"))
-                };
-
-                let tool_result = match result {
-                    Ok(r) => r,
-                    Err(_) => {
-                        let mcp = self.mcp_manager.read().await;
-                        if mcp.is_mcp_tool(tool_name) {
-                            mcp.execute_tool(tool_name, tool_args).await?
-                        } else {
-                            "Tool not available. Enable tools in config.".to_string()
+                let tool_result = if let Some(ref executor) = self.tool_executor {
+                    match executor.execute(tool_name, tool_args).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // If local executor doesn't know this tool, try MCP
+                            let mcp = self.mcp_manager.read().await;
+                            if mcp.is_mcp_tool(tool_name) {
+                                match mcp.execute_tool(tool_name, tool_args).await {
+                                    Ok(r) => r,
+                                    Err(e) => format!("Error: {}", e),
+                                }
+                            } else {
+                                // Real execution error (e.g. file not found) — return it
+                                format!("Error: {}", e)
+                            }
                         }
+                    }
+                } else {
+                    let mcp = self.mcp_manager.read().await;
+                    if mcp.is_mcp_tool(tool_name) {
+                        match mcp.execute_tool(tool_name, tool_args).await {
+                            Ok(r) => r,
+                            Err(e) => format!("Error: {}", e),
+                        }
+                    } else {
+                        "Tool not available. Enable tools in config.".to_string()
                     }
                 };
 
@@ -688,6 +701,7 @@ impl LlmClient {
                     result: tool_result.clone(),
                 });
 
+                let mut messages = self.conversations.write().await;
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(tool_result),
@@ -697,8 +711,6 @@ impl LlmClient {
                 });
             }
         }
-
-        drop(messages);
 
         self.save_conversation().await;
 

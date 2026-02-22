@@ -13,15 +13,17 @@ impl AgentContext {
         }
 
         let mut files = Vec::new();
-        let pattern = format!("{}/*.md", agent_dir.display());
 
-        if let Ok(paths) = glob::glob(&pattern) {
-            for entry in paths.filter_map(|e| e.ok()) {
-                if entry.is_file() {
-                    if let Some(filename) = entry.file_name() {
-                        if let Some(name) = filename.to_str() {
-                            if let Ok(content) = std::fs::read_to_string(&entry) {
-                                files.push((name.to_string(), content));
+        if let Ok(entries) = std::fs::read_dir(&agent_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension() {
+                        if ext == "md" {
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    files.push((name.to_string(), content));
+                                }
                             }
                         }
                     }

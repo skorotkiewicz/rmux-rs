@@ -10,11 +10,7 @@ pub struct TerminalPane;
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     Text(String),
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: String,
-    },
+    ToolCall,
     ToolExecuting {
         name: String,
         arguments: String,
@@ -32,17 +28,17 @@ pub enum UiEvent {
 pub struct PendingResponse {
     pub ready: Arc<AtomicBool>,
     pub conversation: Arc<RwLock<Vec<ChatMessage>>>,
-    pub events: Arc<RwLock<Vec<UiEvent>>>,
+    pub receiver: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiEvent>>>,
     pub error: Arc<RwLock<Option<String>>>,
     pub notified: Arc<AtomicBool>,
 }
 
 impl PendingResponse {
-    pub fn new() -> Self {
+    pub fn new(rx: std::sync::mpsc::Receiver<UiEvent>) -> Self {
         Self {
             ready: Arc::new(AtomicBool::new(false)),
             conversation: Arc::new(RwLock::new(Vec::new())),
-            events: Arc::new(RwLock::new(Vec::new())),
+            receiver: Arc::new(std::sync::Mutex::new(rx)),
             error: Arc::new(RwLock::new(None)),
             notified: Arc::new(AtomicBool::new(false)),
         }
@@ -94,13 +90,11 @@ pub enum TerminalMessage {
     User(String),
     Assistant(String),
     ToolCall {
-        id: String,
-        name: String,
+        title: String,
         arguments: String,
     },
     ToolResult {
-        id: String,
-        name: String,
+        title: String,
         result: String,
     },
     Error(String),
@@ -134,10 +128,9 @@ impl TerminalPane {
         });
 
         if !tab.terminal_state.history_loaded {
-            tab.terminal_state.history_loaded = true;
-            let rt = tokio::runtime::Handle::current();
-            let conv = rt.block_on(async { llm_client.get_conversation().await });
-            for msg in &conv {
+            if let Some(conv) = llm_client.get_conversation() {
+                tab.terminal_state.history_loaded = true;
+                for msg in &conv {
                 match msg.role.as_str() {
                     "user" => {
                         if let Some(content) = &msg.content {
@@ -157,12 +150,15 @@ impl TerminalPane {
                     }
                     _ => {}
                 }
-            }
+                } // End for loop
+            } // End if let Some(conv)
         }
 
         egui::ScrollArea::vertical()
+            .hscroll(false)
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(20, 20, 25);
 
                 if tab.terminal_state.messages.is_empty() {
@@ -193,43 +189,23 @@ impl TerminalPane {
                             }
                         }
                         TerminalMessage::ToolCall {
-                            id,
-                            name,
+                            title,
                             arguments,
                         } => {
-                            let title = if id.is_empty() {
-                                format!("Tool: {}", name)
-                            } else {
-                                format!("Tool: {} [{}]", name, &id[..id.len().min(8)])
-                            };
                             render_box(
                                 ui,
-                                &title,
+                                title,
                                 arguments,
                                 Color32::from_rgb(60, 60, 80),
                                 Color32::from_rgb(255, 200, 100),
                             );
                             ui.add_space(4.0);
                         }
-                        TerminalMessage::ToolResult { id, name, result } => {
-                            let truncated = if result.len() > 500 {
-                                format!(
-                                    "{}...\n[truncated, {} bytes total]",
-                                    &result[..500],
-                                    result.len()
-                                )
-                            } else {
-                                result.clone()
-                            };
-                            let title = if id.is_empty() {
-                                format!("Result: {}", name)
-                            } else {
-                                format!("Result: {} [{}]", name, &id[..id.len().min(8)])
-                            };
+                        TerminalMessage::ToolResult { title, result } => {
                             render_box(
                                 ui,
-                                &title,
-                                &truncated,
+                                title,
+                                result,
                                 Color32::from_rgb(40, 60, 40),
                                 Color32::from_rgb(150, 255, 150),
                             );
@@ -249,59 +225,56 @@ impl TerminalPane {
                 }
 
                 if let Some(pending) = &tab.terminal_state.pending {
-                    if let Ok(events) = pending.events.read() {
-                        for event in events.iter() {
+                    if let Ok(rx) = pending.receiver.try_lock() {
+                        while let Ok(event) = rx.try_recv() {
                             match event {
                                 UiEvent::Text(text) => {
                                     if let Some(last) = tab.terminal_state.messages.last_mut() {
                                         if let TerminalMessage::Assistant(content) = last {
-                                            content.push_str(text);
+                                            content.push_str(&text);
                                             continue;
                                         }
                                     }
                                     tab.terminal_state
                                         .messages
-                                        .push(TerminalMessage::Assistant(text.clone()));
+                                        .push(TerminalMessage::Assistant(text));
                                 }
-                                UiEvent::ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                } => {
-                                    tab.terminal_state.messages.push(TerminalMessage::ToolCall {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
-                                    });
+                                UiEvent::ToolCall => {
+                                    // Suppressed: ToolExecuting shows the complete tool call
                                 }
                                 UiEvent::ToolResult { id, name, result } => {
+                                    let truncated = if result.len() > 500 {
+                                        format!(
+                                            "{}...\n[truncated, {} bytes total]",
+                                            &result[..500],
+                                            result.len()
+                                        )
+                                    } else {
+                                        result
+                                    };
+                                    let title = if id.is_empty() {
+                                        format!("Result: {}", name)
+                                    } else {
+                                        format!("Result: {} [{}]", name, &id[..id.len().min(8)])
+                                    };
                                     tab.terminal_state
                                         .messages
-                                        .push(TerminalMessage::ToolResult {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            result: result.clone(),
-                                        });
+                                        .push(TerminalMessage::ToolResult { title, result: truncated });
                                 }
                                 UiEvent::ToolExecuting { name, arguments } => {
                                     tab.terminal_state.messages.push(TerminalMessage::ToolCall {
-                                        id: String::new(),
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
+                                        title: format!("Tool: {}", name),
+                                        arguments,
                                     });
                                 }
                                 UiEvent::Error(err) => {
                                     tab.terminal_state
                                         .messages
-                                        .push(TerminalMessage::Error(err.clone()));
+                                        .push(TerminalMessage::Error(err));
                                 }
                                 UiEvent::Done => {}
                             }
                         }
-                    }
-
-                    if let Ok(mut events) = pending.events.write() {
-                        events.clear();
                     }
 
                     if pending.ready.load(Ordering::Relaxed) {
@@ -313,65 +286,107 @@ impl TerminalPane {
                             }
                         }
                         tab.terminal_state.pending = None;
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                egui::RichText::new("Thinking...")
-                                    .font(egui::FontId::monospace(12.0))
-                                    .color(Color32::from_rgb(150, 150, 150))
-                                    .italics(),
-                            );
-                        });
                     }
                 }
 
+                // Input area
+                let is_pending = tab.terminal_state.pending.is_some();
+
+                // Cancel button when request is pending
+                if is_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Thinking...")
+                                .font(egui::FontId::monospace(12.0))
+                                .color(Color32::from_rgb(150, 150, 150))
+                                .italics(),
+                        );
+                    });
+                }
+
+                // Check if Enter was pressed (without Shift) to send
+                let enter_pressed = ui.input(|i| {
+                    i.key_pressed(egui::Key::Enter)
+                        && !i.modifiers.shift
+                });
+
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(">")
-                            .font(egui::FontId::monospace(13.0))
-                            .color(Color32::from_rgb(100, 255, 100)),
-                    );
+                    // ui.label(
+                    //     egui::RichText::new(">")
+                    //         .font(egui::FontId::monospace(13.0))
+                    //         .color(Color32::from_rgb(100, 255, 100)),
+                    // );
 
                     let response = ui.add(
-                        TextEdit::singleline(&mut tab.terminal_state.input)
-                            .desired_width(f32::INFINITY)
+                        TextEdit::multiline(&mut tab.terminal_state.input)
+                            .desired_width(ui.available_width() - 60.0)
+                            .desired_rows(2)
                             .font(egui::FontId::monospace(13.0))
-                            .text_color(Color32::from_rgb(220, 220, 220)),
+                            .text_color(Color32::from_rgb(220, 220, 220))
+                            .lock_focus(true),
                     );
 
-                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if !tab.terminal_state.input.trim().is_empty()
-                            && tab.terminal_state.pending.is_none()
+                    // Send/Cancel button
+                    let should_send = if is_pending {
+                        if ui
+                            .button(
+                                egui::RichText::new(format!("{}", regular::STOP))
+                                    .color(Color32::from_rgb(255, 100, 100)),
+                            )
+                            .clicked()
                         {
+                            if let Some(handle) = &tab.abort_handle {
+                                handle.abort();
+                            }
+                            tab.terminal_state.pending = None;
+                            tab.terminal_state
+                                .messages
+                                .push(TerminalMessage::Error("Request cancelled.".to_string()));
+                        }
+                        false
+                    } else {
+                        ui.button(
+                            egui::RichText::new(format!("{}", regular::PAPER_PLANE_RIGHT))
+                                .color(Color32::from_rgb(100, 255, 100)),
+                        )
+                        .clicked()
+                    };
+
+                    // Enter sends, Shift+Enter inserts newline
+                    let trigger_send = (enter_pressed && response.has_focus()) || should_send;
+
+                    if trigger_send {
+                        // Remove the newline that Enter just inserted
+                        if tab.terminal_state.input.ends_with('\n') {
+                            tab.terminal_state.input.pop();
+                        }
+
+                        if !tab.terminal_state.input.trim().is_empty() && !is_pending {
                             let user_msg = tab.terminal_state.input.trim().to_string();
                             tab.terminal_state
                                 .messages
                                 .push(TerminalMessage::User(user_msg.clone()));
                             tab.terminal_state.input.clear();
 
-                            let pending = PendingResponse::new();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let pending = PendingResponse::new(rx);
 
                             let ready = pending.ready.clone();
                             let conversation_arc = pending.conversation.clone();
-                            let events_arc = pending.events.clone();
                             let error_arc = pending.error.clone();
                             let client = llm_client.clone();
 
-                            tokio::spawn(async move {
+                            let handle = tokio::spawn(async move {
                                 let result = client
                                     .send_message_stream(&user_msg, |event| {
                                         let ui_event = match event {
                                             StreamEvent::Text(t) => UiEvent::Text(t),
-                                            StreamEvent::ToolCallStart { id, name } => {
-                                                UiEvent::ToolCall {
-                                                    id,
-                                                    name,
-                                                    arguments: String::new(),
-                                                }
+                                            StreamEvent::ToolCallStart => {
+                                                UiEvent::ToolCall
                                             }
-                                            StreamEvent::ToolCallDelta(args) => {
-                                                UiEvent::Text(format!(" {}", args))
+                                            StreamEvent::ToolCallDelta => {
+                                                UiEvent::Done
                                             }
                                             StreamEvent::ToolCallEnd => UiEvent::Done,
                                             StreamEvent::ToolExecuting { name, arguments } => {
@@ -384,17 +399,16 @@ impl TerminalPane {
                                             StreamEvent::Error(e) => UiEvent::Error(e),
                                         };
 
-                                        if let Ok(mut events) = events_arc.write() {
-                                            events.push(ui_event);
-                                        }
+                                        let _ = tx.send(ui_event);
                                     })
                                     .await;
 
                                 match result {
                                     Ok(_) => {
-                                        let conv = client.get_conversation().await;
-                                        if let Ok(mut guard) = conversation_arc.write() {
-                                            *guard = conv;
+                                        if let Some(conv) = client.get_conversation() {
+                                            if let Ok(mut guard) = conversation_arc.write() {
+                                                *guard = conv;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -406,6 +420,7 @@ impl TerminalPane {
                                 ready.store(true, Ordering::Relaxed);
                             });
 
+                            tab.abort_handle = Some(handle.abort_handle());
                             tab.terminal_state.pending = Some(pending);
                         }
                         response.request_focus();
@@ -413,7 +428,10 @@ impl TerminalPane {
                 });
             });
 
-        ui.ctx().request_repaint();
+        // Only repaint continuously when there's a pending response
+        if tab.terminal_state.pending.is_some() {
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -430,10 +448,13 @@ fn render_message_header(ui: &mut egui::Ui, label: &str, color: Color32) {
 
 fn render_content(ui: &mut egui::Ui, content: &str, color: Color32) {
     for line in content.lines() {
-        ui.label(
-            egui::RichText::new(line)
-                .font(egui::FontId::monospace(12.0))
-                .color(color),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(line)
+                    .font(egui::FontId::monospace(12.0))
+                    .color(color),
+            )
+            .wrap(),
         );
     }
 }
@@ -459,19 +480,23 @@ fn render_box(
                 );
             });
 
-            for line in content.lines().take(20) {
-                ui.label(
-                    egui::RichText::new(line)
-                        .font(egui::FontId::monospace(11.0))
-                        .color(Color32::from_rgb(200, 200, 200)),
+            let lines: Vec<&str> = content.lines().collect();
+            for line in lines.iter().take(20) {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(*line)
+                            .font(egui::FontId::monospace(11.0))
+                            .color(Color32::from_rgb(200, 200, 200)),
+                    )
+                    .wrap(),
                 );
             }
 
-            if content.lines().count() > 20 {
+            if lines.len() > 20 {
                 ui.label(
                     egui::RichText::new(format!(
                         "... ({} more lines)",
-                        content.lines().count() - 20
+                        lines.len() - 20
                     ))
                     .font(egui::FontId::monospace(10.0))
                     .color(Color32::from_rgb(150, 150, 150))

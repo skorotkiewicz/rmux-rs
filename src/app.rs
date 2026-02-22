@@ -7,6 +7,7 @@ use egui_dock::{DockArea, DockState, TabViewer, tab_viewer::OnCloseResponse};
 use egui_phosphor::regular;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use uuid::Uuid;
 
 pub struct RmuxApp {
@@ -20,6 +21,7 @@ pub struct RmuxApp {
     show_notifications: bool,
     presets: Vec<String>,
     selected_preset: Option<String>,
+    git_branch_last_check: Instant,
 }
 
 #[derive(Clone)]
@@ -30,8 +32,9 @@ pub struct Tab {
     pub pane_type: PaneType,
     pub has_notification: bool,
     pub terminal_state: TerminalState,
-    pub llm_client: Arc<LlmClient>,
+    pub llm_client: Option<Arc<LlmClient>>,
     pub preset_name: Option<String>,
+    pub abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -54,7 +57,7 @@ impl Tab {
 
         let client = Arc::new(llm_client);
         let client_clone = client.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = client_clone.initialize().await {
                 eprintln!("[rmux] Failed to initialize tab client: {}", e);
             }
@@ -70,8 +73,9 @@ impl Tab {
             pane_type,
             has_notification: false,
             terminal_state: TerminalState::default(),
-            llm_client: client,
+            llm_client: Some(client),
             preset_name: preset.map(|s| s.to_string()),
+            abort_handle: Some(handle.abort_handle()),
         }
     }
 }
@@ -83,7 +87,7 @@ impl RmuxApp {
         cc.egui_ctx.set_fonts(fonts);
 
         let workspace_id = Uuid::new_v4();
-        let workspace = Workspace::new(workspace_id, "Workspace 1".to_string());
+        let workspace = Workspace::new("Workspace 1".to_string());
 
         let mut workspaces = HashMap::new();
         workspaces.insert(workspace_id, workspace);
@@ -113,6 +117,7 @@ impl RmuxApp {
             show_notifications: false,
             presets,
             selected_preset,
+            git_branch_last_check: Instant::now() - std::time::Duration::from_secs(10),
         }
     }
 
@@ -157,7 +162,7 @@ impl RmuxApp {
     fn add_workspace(&mut self) {
         let id = Uuid::new_v4();
         let num = self.workspaces.len() + 1;
-        let workspace = Workspace::new(id, format!("Workspace {}", num));
+        let workspace = Workspace::new(format!("Workspace {}", num));
 
         let tab = Tab::new(
             id,
@@ -199,10 +204,9 @@ impl RmuxApp {
                     pane_type: PaneType::Browser,
                     has_notification: false,
                     terminal_state: TerminalState::default(),
-                    llm_client: std::sync::Arc::new(
-                        crate::ai::llm_client::LlmClient::default_client(),
-                    ),
+                    llm_client: None,
                     preset_name: None,
+                    abort_handle: None,
                 };
                 dock_state.push_to_focused_leaf(tab);
             }
@@ -267,6 +271,19 @@ impl RmuxApp {
         let current_workspace = self.current_workspace;
 
         for (workspace_id, dock_state) in self.dock_states.iter_mut() {
+            let mut has_any_pending = false;
+            for (_surface, node) in dock_state.iter_all_nodes() {
+                if let Some(tabs) = node.tabs() {
+                    if tabs.iter().any(|t| t.terminal_state.pending.is_some()) {
+                        has_any_pending = true;
+                        break;
+                    }
+                }
+            }
+            if !has_any_pending {
+                continue;
+            }
+
             let is_current_workspace = current_workspace == Some(*workspace_id);
             let focused_tab_id = dock_state.find_active_focused().map(|(_, t)| t.id);
 
@@ -329,11 +346,15 @@ impl RmuxApp {
             if self.presets.is_empty() {
                 ui.label(egui::RichText::new("No presets in config").italics().weak());
             } else {
-                for preset in &self.presets.clone() {
+                let mut new_preset = None;
+                for preset in &self.presets {
                     let is_selected = self.selected_preset.as_ref() == Some(preset);
                     if ui.selectable_label(is_selected, preset).clicked() {
-                        self.switch_preset(preset);
+                        new_preset = Some(preset.clone());
                     }
+                }
+                if let Some(p) = new_preset {
+                    self.switch_preset(&p);
                 }
             }
 
@@ -361,8 +382,10 @@ impl RmuxApp {
                         for (_surface, node) in dock_state.iter_all_nodes() {
                             if let Some(tabs) = node.tabs() {
                                 if let Some(tab) = tabs.first() {
-                                    if let Some(ws_path) = tab.llm_client.get_workspace() {
-                                        workspace.update_from_cwd(&ws_path.to_string_lossy());
+                                    if let Some(ref client) = tab.llm_client {
+                                        if let Some(ws_path) = client.get_workspace() {
+                                            workspace.update_from_cwd(&ws_path.to_string_lossy());
+                                        }
                                     }
                                 }
                             }
@@ -388,20 +411,27 @@ impl RmuxApp {
                                 cwd.clone()
                             };
                             ui.label(egui::RichText::new(&truncated_cwd).small().weak());
-                            if cwd.contains("/") || cwd.contains("\\") {
-                                let path = std::path::Path::new(cwd);
-                                if path.join(".git").exists() {
-                                    if let Ok(output) = std::process::Command::new("git")
-                                        .args(["branch", "--show-current"])
-                                        .current_dir(path)
-                                        .output()
-                                    {
-                                        if output.status.success() {
-                                            let branch = String::from_utf8_lossy(&output.stdout)
-                                                .trim()
-                                                .to_string();
-                                            if !branch.is_empty() {
-                                                workspace.set_git_branch(&branch);
+
+                            // Only check git branch every 5 seconds to avoid blocking UI
+                            let should_check_git = self.git_branch_last_check.elapsed()
+                                >= std::time::Duration::from_secs(5);
+                            if should_check_git {
+                                self.git_branch_last_check = Instant::now();
+                                if cwd.contains("/") || cwd.contains("\\") {
+                                    let path = std::path::Path::new(cwd);
+                                    if path.join(".git").exists() {
+                                        if let Ok(output) = std::process::Command::new("git")
+                                            .args(["branch", "--show-current"])
+                                            .current_dir(path)
+                                            .output()
+                                        {
+                                            if output.status.success() {
+                                                let branch = String::from_utf8_lossy(&output.stdout)
+                                                    .trim()
+                                                    .to_string();
+                                                if !branch.is_empty() {
+                                                    workspace.set_git_branch(&branch);
+                                                }
                                             }
                                         }
                                     }
@@ -416,21 +446,14 @@ impl RmuxApp {
                             );
                         }
 
-                        let workspace_notifications: Vec<(Uuid, String, String, String, bool)> =
-                            self.notifications
-                                .get_notifications_for_workspace(id)
-                                .iter()
-                                .map(|n| {
-                                    (
-                                        n.id,
-                                        n.title.clone(),
-                                        n.subtitle.clone(),
-                                        n.body.clone(),
-                                        n.read,
-                                    )
-                                })
-                                .collect();
-                        for (notif_id, title, subtitle, body, read) in workspace_notifications {
+                        let mut mark_read_queue = Vec::new();
+                        let workspace_notifications = self.notifications.get_notifications_for_workspace(id);
+                        for n in workspace_notifications {
+                            let notif_id = n.id;
+                            let title = n.title.as_str();
+                            let subtitle = n.subtitle.as_str();
+                            let body = n.body.as_str();
+                            let read = n.read;
                             let color = if read {
                                 egui::Color32::from_rgb(150, 150, 150)
                             } else {
@@ -443,12 +466,12 @@ impl RmuxApp {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         if ui.small_button(regular::CHECK).clicked() {
-                                            self.notifications.mark_read(notif_id);
+                                            mark_read_queue.push(notif_id);
                                         }
                                         ui.vertical(|ui| {
                                             ui.horizontal(|ui| {
                                                 ui.label(
-                                                    egui::RichText::new(&title)
+                                                    egui::RichText::new(title)
                                                         .color(color)
                                                         .small()
                                                         .strong(),
@@ -456,7 +479,7 @@ impl RmuxApp {
                                             });
                                             if !subtitle.is_empty() {
                                                 ui.label(
-                                                    egui::RichText::new(&subtitle)
+                                                    egui::RichText::new(subtitle)
                                                         .color(egui::Color32::from_rgb(
                                                             150, 150, 150,
                                                         ))
@@ -466,7 +489,7 @@ impl RmuxApp {
                                             if !body.is_empty() {
                                                 ui.label(
                                                     egui::RichText::new(
-                                                        &body.chars().take(50).collect::<String>(),
+                                                        body.chars().take(50).collect::<String>(),
                                                     )
                                                     .small()
                                                     .weak(),
@@ -476,6 +499,9 @@ impl RmuxApp {
                                     });
                                 });
                             ui.add_space(2.0);
+                        }
+                        for notif_id in mark_read_queue {
+                            self.notifications.mark_read(notif_id);
                         }
                     }
                 }
@@ -507,9 +533,11 @@ impl RmuxApp {
                                             .weak(),
                                     );
                                 }
-                                let tools = tab.llm_client.get_tools();
-                                let rt = tokio::runtime::Handle::current();
-                                let tools_guard = rt.block_on(async { tools.read().await.clone() });
+                                let tools = match tab.llm_client {
+                                    Some(ref client) => client.get_tools(),
+                                    None => { break; }
+                                };
+                                let tools_guard = tools.try_read().map(|g| g.clone()).unwrap_or_default();
                                 if tools_guard.is_empty() {
                                     ui.label(
                                         egui::RichText::new("No tools enabled").italics().weak(),
@@ -536,8 +564,7 @@ impl RmuxApp {
 
                                 ui.add_space(5.0);
                                 ui.label(egui::RichText::new("MCP Servers:").small().weak());
-                                let mcp_status =
-                                    rt.block_on(async { tab.llm_client.get_mcp_status().await });
+                                let mcp_status = tab.llm_client.as_ref().and_then(|c| c.get_mcp_status()).unwrap_or_default();
                                 if mcp_status.is_empty() {
                                     ui.label(
                                         egui::RichText::new("None connected")
@@ -563,10 +590,10 @@ impl RmuxApp {
                                                     .small()
                                                     .color(status_color),
                                             );
-                                            let client = tab.llm_client.clone();
+                                            let client = tab.llm_client.clone().unwrap();
                                             let name_clone = name.clone();
                                             if ui.small_button(regular::X).clicked() {
-                                                rt.block_on(async {
+                                                tokio::spawn(async move {
                                                     client.disconnect_mcp(&name_clone).await;
                                                 });
                                             }
@@ -602,24 +629,17 @@ impl RmuxApp {
             });
             ui.separator();
 
-            let all: Vec<(Uuid, String, String, String, bool)> = self
-                .notifications
-                .all_notifications()
-                .iter()
-                .map(|n| {
-                    (
-                        n.id,
-                        n.title.clone(),
-                        n.subtitle.clone(),
-                        n.body.clone(),
-                        n.read,
-                    )
-                })
-                .collect();
+            let mut mark_read_queue = Vec::new();
+            let all = self.notifications.all_notifications();
             if all.is_empty() {
                 ui.label(egui::RichText::new("No notifications").italics().weak());
             } else {
-                for (notif_id, title, subtitle, body, read) in all {
+                for n in all {
+                    let notif_id = n.id;
+                    let title = n.title.as_str();
+                    let subtitle = n.subtitle.as_str();
+                    let body = n.body.as_str();
+                    let read = n.read;
                     let bg = if read {
                         egui::Color32::from_rgb(30, 30, 35)
                     } else {
@@ -633,19 +653,22 @@ impl RmuxApp {
                             ui.horizontal(|ui| {
                                 if !read {
                                     if ui.small_button(regular::CHECK).clicked() {
-                                        self.notifications.mark_read(notif_id);
+                                        mark_read_queue.push(notif_id);
                                     }
                                 }
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(&title).strong());
-                                        ui.label(egui::RichText::new(&subtitle).weak().small());
+                                        ui.label(egui::RichText::new(title).strong());
+                                        ui.label(egui::RichText::new(subtitle).weak().small());
                                     });
-                                    ui.label(egui::RichText::new(&body).small());
+                                    ui.label(egui::RichText::new(body).small());
                                 });
                             });
                         });
                     ui.add_space(4.0);
+                }
+                for notif_id in mark_read_queue {
+                    self.notifications.mark_read(notif_id);
                 }
 
                 ui.separator();
@@ -763,7 +786,9 @@ impl TabViewer for TabViewerImpl<'_> {
         }
         match tab.pane_type {
             PaneType::Terminal => {
-                TerminalPane::show(ui, tab, tab.llm_client.clone());
+                if let Some(ref client) = tab.llm_client {
+                    TerminalPane::show(ui, tab, client.clone());
+                }
             }
             PaneType::Browser => {
                 ui.vertical(|ui| {
@@ -783,7 +808,10 @@ impl TabViewer for TabViewerImpl<'_> {
         }
     }
 
-    fn on_close(&mut self, _tab: &mut Self::Tab) -> OnCloseResponse {
+    fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
+        if let Some(handle) = &tab.abort_handle {
+            handle.abort();
+        }
         OnCloseResponse::Close
     }
 }

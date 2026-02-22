@@ -32,17 +32,17 @@ pub enum UiEvent {
 pub struct PendingResponse {
     pub ready: Arc<AtomicBool>,
     pub conversation: Arc<RwLock<Vec<ChatMessage>>>,
-    pub events: Arc<RwLock<Vec<UiEvent>>>,
+    pub receiver: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiEvent>>>,
     pub error: Arc<RwLock<Option<String>>>,
     pub notified: Arc<AtomicBool>,
 }
 
 impl PendingResponse {
-    pub fn new() -> Self {
+    pub fn new(rx: std::sync::mpsc::Receiver<UiEvent>) -> Self {
         Self {
             ready: Arc::new(AtomicBool::new(false)),
             conversation: Arc::new(RwLock::new(Vec::new())),
-            events: Arc::new(RwLock::new(Vec::new())),
+            receiver: Arc::new(std::sync::Mutex::new(rx)),
             error: Arc::new(RwLock::new(None)),
             notified: Arc::new(AtomicBool::new(false)),
         }
@@ -94,13 +94,11 @@ pub enum TerminalMessage {
     User(String),
     Assistant(String),
     ToolCall {
-        id: String,
-        name: String,
+        title: String,
         arguments: String,
     },
     ToolResult {
-        id: String,
-        name: String,
+        title: String,
         result: String,
     },
     Error(String),
@@ -134,10 +132,9 @@ impl TerminalPane {
         });
 
         if !tab.terminal_state.history_loaded {
-            tab.terminal_state.history_loaded = true;
-            let rt = tokio::runtime::Handle::current();
-            let conv = rt.block_on(async { llm_client.get_conversation().await });
-            for msg in &conv {
+            if let Some(conv) = llm_client.get_conversation() {
+                tab.terminal_state.history_loaded = true;
+                for msg in &conv {
                 match msg.role.as_str() {
                     "user" => {
                         if let Some(content) = &msg.content {
@@ -157,7 +154,8 @@ impl TerminalPane {
                     }
                     _ => {}
                 }
-            }
+                } // End for loop
+            } // End if let Some(conv)
         }
 
         egui::ScrollArea::vertical()
@@ -193,43 +191,23 @@ impl TerminalPane {
                             }
                         }
                         TerminalMessage::ToolCall {
-                            id,
-                            name,
+                            title,
                             arguments,
                         } => {
-                            let title = if id.is_empty() {
-                                format!("Tool: {}", name)
-                            } else {
-                                format!("Tool: {} [{}]", name, &id[..id.len().min(8)])
-                            };
                             render_box(
                                 ui,
-                                &title,
+                                title,
                                 arguments,
                                 Color32::from_rgb(60, 60, 80),
                                 Color32::from_rgb(255, 200, 100),
                             );
                             ui.add_space(4.0);
                         }
-                        TerminalMessage::ToolResult { id, name, result } => {
-                            let truncated = if result.len() > 500 {
-                                format!(
-                                    "{}...\n[truncated, {} bytes total]",
-                                    &result[..500],
-                                    result.len()
-                                )
-                            } else {
-                                result.clone()
-                            };
-                            let title = if id.is_empty() {
-                                format!("Result: {}", name)
-                            } else {
-                                format!("Result: {} [{}]", name, &id[..id.len().min(8)])
-                            };
+                        TerminalMessage::ToolResult { title, result } => {
                             render_box(
                                 ui,
-                                &title,
-                                &truncated,
+                                title,
+                                result,
                                 Color32::from_rgb(40, 60, 40),
                                 Color32::from_rgb(150, 255, 150),
                             );
@@ -249,59 +227,65 @@ impl TerminalPane {
                 }
 
                 if let Some(pending) = &tab.terminal_state.pending {
-                    if let Ok(events) = pending.events.read() {
-                        for event in events.iter() {
+                    if let Ok(rx) = pending.receiver.try_lock() {
+                        while let Ok(event) = rx.try_recv() {
                             match event {
                                 UiEvent::Text(text) => {
                                     if let Some(last) = tab.terminal_state.messages.last_mut() {
                                         if let TerminalMessage::Assistant(content) = last {
-                                            content.push_str(text);
+                                            content.push_str(&text);
                                             continue;
                                         }
                                     }
                                     tab.terminal_state
                                         .messages
-                                        .push(TerminalMessage::Assistant(text.clone()));
+                                        .push(TerminalMessage::Assistant(text));
                                 }
                                 UiEvent::ToolCall {
                                     id,
                                     name,
                                     arguments,
                                 } => {
-                                    tab.terminal_state.messages.push(TerminalMessage::ToolCall {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
-                                    });
+                                    let title = if id.is_empty() {
+                                        format!("Tool: {}", name)
+                                    } else {
+                                        format!("Tool: {} [{}]", name, &id[..id.len().min(8)])
+                                    };
+                                    tab.terminal_state.messages.push(TerminalMessage::ToolCall { title, arguments });
                                 }
                                 UiEvent::ToolResult { id, name, result } => {
+                                    let truncated = if result.len() > 500 {
+                                        format!(
+                                            "{}...\n[truncated, {} bytes total]",
+                                            &result[..500],
+                                            result.len()
+                                        )
+                                    } else {
+                                        result
+                                    };
+                                    let title = if id.is_empty() {
+                                        format!("Result: {}", name)
+                                    } else {
+                                        format!("Result: {} [{}]", name, &id[..id.len().min(8)])
+                                    };
                                     tab.terminal_state
                                         .messages
-                                        .push(TerminalMessage::ToolResult {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            result: result.clone(),
-                                        });
+                                        .push(TerminalMessage::ToolResult { title, result: truncated });
                                 }
                                 UiEvent::ToolExecuting { name, arguments } => {
                                     tab.terminal_state.messages.push(TerminalMessage::ToolCall {
-                                        id: String::new(),
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
+                                        title: format!("Tool: {}", name),
+                                        arguments,
                                     });
                                 }
                                 UiEvent::Error(err) => {
                                     tab.terminal_state
                                         .messages
-                                        .push(TerminalMessage::Error(err.clone()));
+                                        .push(TerminalMessage::Error(err));
                                 }
                                 UiEvent::Done => {}
                             }
                         }
-                    }
-
-                    if let Ok(mut events) = pending.events.write() {
-                        events.clear();
                     }
 
                     if pending.ready.load(Ordering::Relaxed) {
@@ -350,11 +334,11 @@ impl TerminalPane {
                                 .push(TerminalMessage::User(user_msg.clone()));
                             tab.terminal_state.input.clear();
 
-                            let pending = PendingResponse::new();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let pending = PendingResponse::new(rx);
 
                             let ready = pending.ready.clone();
                             let conversation_arc = pending.conversation.clone();
-                            let events_arc = pending.events.clone();
                             let error_arc = pending.error.clone();
                             let client = llm_client.clone();
 
@@ -384,17 +368,16 @@ impl TerminalPane {
                                             StreamEvent::Error(e) => UiEvent::Error(e),
                                         };
 
-                                        if let Ok(mut events) = events_arc.write() {
-                                            events.push(ui_event);
-                                        }
+                                        let _ = tx.send(ui_event);
                                     })
                                     .await;
 
                                 match result {
                                     Ok(_) => {
-                                        let conv = client.get_conversation().await;
-                                        if let Ok(mut guard) = conversation_arc.write() {
-                                            *guard = conv;
+                                        if let Some(conv) = client.get_conversation() {
+                                            if let Ok(mut guard) = conversation_arc.write() {
+                                                *guard = conv;
+                                            }
                                         }
                                     }
                                     Err(e) => {

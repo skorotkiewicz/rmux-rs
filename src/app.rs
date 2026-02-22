@@ -32,6 +32,7 @@ pub struct Tab {
     pub terminal_state: TerminalState,
     pub llm_client: Arc<LlmClient>,
     pub preset_name: Option<String>,
+    pub abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -54,7 +55,7 @@ impl Tab {
 
         let client = Arc::new(llm_client);
         let client_clone = client.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = client_clone.initialize().await {
                 eprintln!("[rmux] Failed to initialize tab client: {}", e);
             }
@@ -72,6 +73,7 @@ impl Tab {
             terminal_state: TerminalState::default(),
             llm_client: client,
             preset_name: preset.map(|s| s.to_string()),
+            abort_handle: Some(handle.abort_handle()),
         }
     }
 }
@@ -203,6 +205,7 @@ impl RmuxApp {
                         crate::ai::llm_client::LlmClient::default_client(),
                     ),
                     preset_name: None,
+                    abort_handle: None,
                 };
                 dock_state.push_to_focused_leaf(tab);
             }
@@ -267,6 +270,19 @@ impl RmuxApp {
         let current_workspace = self.current_workspace;
 
         for (workspace_id, dock_state) in self.dock_states.iter_mut() {
+            let mut has_any_pending = false;
+            for (_surface, node) in dock_state.iter_all_nodes() {
+                if let Some(tabs) = node.tabs() {
+                    if tabs.iter().any(|t| t.terminal_state.pending.is_some()) {
+                        has_any_pending = true;
+                        break;
+                    }
+                }
+            }
+            if !has_any_pending {
+                continue;
+            }
+
             let is_current_workspace = current_workspace == Some(*workspace_id);
             let focused_tab_id = dock_state.find_active_focused().map(|(_, t)| t.id);
 
@@ -329,11 +345,15 @@ impl RmuxApp {
             if self.presets.is_empty() {
                 ui.label(egui::RichText::new("No presets in config").italics().weak());
             } else {
-                for preset in &self.presets.clone() {
+                let mut new_preset = None;
+                for preset in &self.presets {
                     let is_selected = self.selected_preset.as_ref() == Some(preset);
                     if ui.selectable_label(is_selected, preset).clicked() {
-                        self.switch_preset(preset);
+                        new_preset = Some(preset.clone());
                     }
+                }
+                if let Some(p) = new_preset {
+                    self.switch_preset(&p);
                 }
             }
 
@@ -416,21 +436,14 @@ impl RmuxApp {
                             );
                         }
 
-                        let workspace_notifications: Vec<(Uuid, String, String, String, bool)> =
-                            self.notifications
-                                .get_notifications_for_workspace(id)
-                                .iter()
-                                .map(|n| {
-                                    (
-                                        n.id,
-                                        n.title.clone(),
-                                        n.subtitle.clone(),
-                                        n.body.clone(),
-                                        n.read,
-                                    )
-                                })
-                                .collect();
-                        for (notif_id, title, subtitle, body, read) in workspace_notifications {
+                        let mut mark_read_queue = Vec::new();
+                        let workspace_notifications = self.notifications.get_notifications_for_workspace(id);
+                        for n in workspace_notifications {
+                            let notif_id = n.id;
+                            let title = n.title.as_str();
+                            let subtitle = n.subtitle.as_str();
+                            let body = n.body.as_str();
+                            let read = n.read;
                             let color = if read {
                                 egui::Color32::from_rgb(150, 150, 150)
                             } else {
@@ -443,12 +456,12 @@ impl RmuxApp {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         if ui.small_button(regular::CHECK).clicked() {
-                                            self.notifications.mark_read(notif_id);
+                                            mark_read_queue.push(notif_id);
                                         }
                                         ui.vertical(|ui| {
                                             ui.horizontal(|ui| {
                                                 ui.label(
-                                                    egui::RichText::new(&title)
+                                                    egui::RichText::new(title)
                                                         .color(color)
                                                         .small()
                                                         .strong(),
@@ -456,7 +469,7 @@ impl RmuxApp {
                                             });
                                             if !subtitle.is_empty() {
                                                 ui.label(
-                                                    egui::RichText::new(&subtitle)
+                                                    egui::RichText::new(subtitle)
                                                         .color(egui::Color32::from_rgb(
                                                             150, 150, 150,
                                                         ))
@@ -466,7 +479,7 @@ impl RmuxApp {
                                             if !body.is_empty() {
                                                 ui.label(
                                                     egui::RichText::new(
-                                                        &body.chars().take(50).collect::<String>(),
+                                                        body.chars().take(50).collect::<String>(),
                                                     )
                                                     .small()
                                                     .weak(),
@@ -476,6 +489,9 @@ impl RmuxApp {
                                     });
                                 });
                             ui.add_space(2.0);
+                        }
+                        for notif_id in mark_read_queue {
+                            self.notifications.mark_read(notif_id);
                         }
                     }
                 }
@@ -508,8 +524,7 @@ impl RmuxApp {
                                     );
                                 }
                                 let tools = tab.llm_client.get_tools();
-                                let rt = tokio::runtime::Handle::current();
-                                let tools_guard = rt.block_on(async { tools.read().await.clone() });
+                                let tools_guard = tools.try_read().map(|g| g.clone()).unwrap_or_default();
                                 if tools_guard.is_empty() {
                                     ui.label(
                                         egui::RichText::new("No tools enabled").italics().weak(),
@@ -536,8 +551,7 @@ impl RmuxApp {
 
                                 ui.add_space(5.0);
                                 ui.label(egui::RichText::new("MCP Servers:").small().weak());
-                                let mcp_status =
-                                    rt.block_on(async { tab.llm_client.get_mcp_status().await });
+                                let mcp_status = tab.llm_client.get_mcp_status().unwrap_or_default();
                                 if mcp_status.is_empty() {
                                     ui.label(
                                         egui::RichText::new("None connected")
@@ -566,7 +580,7 @@ impl RmuxApp {
                                             let client = tab.llm_client.clone();
                                             let name_clone = name.clone();
                                             if ui.small_button(regular::X).clicked() {
-                                                rt.block_on(async {
+                                                tokio::spawn(async move {
                                                     client.disconnect_mcp(&name_clone).await;
                                                 });
                                             }
@@ -602,24 +616,17 @@ impl RmuxApp {
             });
             ui.separator();
 
-            let all: Vec<(Uuid, String, String, String, bool)> = self
-                .notifications
-                .all_notifications()
-                .iter()
-                .map(|n| {
-                    (
-                        n.id,
-                        n.title.clone(),
-                        n.subtitle.clone(),
-                        n.body.clone(),
-                        n.read,
-                    )
-                })
-                .collect();
+            let mut mark_read_queue = Vec::new();
+            let all = self.notifications.all_notifications();
             if all.is_empty() {
                 ui.label(egui::RichText::new("No notifications").italics().weak());
             } else {
-                for (notif_id, title, subtitle, body, read) in all {
+                for n in all {
+                    let notif_id = n.id;
+                    let title = n.title.as_str();
+                    let subtitle = n.subtitle.as_str();
+                    let body = n.body.as_str();
+                    let read = n.read;
                     let bg = if read {
                         egui::Color32::from_rgb(30, 30, 35)
                     } else {
@@ -633,19 +640,22 @@ impl RmuxApp {
                             ui.horizontal(|ui| {
                                 if !read {
                                     if ui.small_button(regular::CHECK).clicked() {
-                                        self.notifications.mark_read(notif_id);
+                                        mark_read_queue.push(notif_id);
                                     }
                                 }
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new(&title).strong());
-                                        ui.label(egui::RichText::new(&subtitle).weak().small());
+                                        ui.label(egui::RichText::new(title).strong());
+                                        ui.label(egui::RichText::new(subtitle).weak().small());
                                     });
-                                    ui.label(egui::RichText::new(&body).small());
+                                    ui.label(egui::RichText::new(body).small());
                                 });
                             });
                         });
                     ui.add_space(4.0);
+                }
+                for notif_id in mark_read_queue {
+                    self.notifications.mark_read(notif_id);
                 }
 
                 ui.separator();
@@ -783,7 +793,10 @@ impl TabViewer for TabViewerImpl<'_> {
         }
     }
 
-    fn on_close(&mut self, _tab: &mut Self::Tab) -> OnCloseResponse {
+    fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
+        if let Some(handle) = &tab.abort_handle {
+            handle.abort();
+        }
         OnCloseResponse::Close
     }
 }

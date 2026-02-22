@@ -137,38 +137,18 @@ impl Config {
 
         if let Some(preset_name) = preset {
             if let Some(preset_config) = file.presets.get(preset_name) {
-                if preset_config.mode.is_some() {
-                    base.mode = preset_config.mode.clone();
-                }
-                if preset_config.endpoint.is_some() {
-                    base.endpoint = preset_config.endpoint.clone();
-                }
-                if preset_config.model.is_some() {
-                    base.model = preset_config.model.clone();
-                }
-                if preset_config.api_key.is_some() {
-                    base.api_key = preset_config.api_key.clone();
-                }
-                if preset_config.system.is_some() {
-                    base.system = preset_config.system.clone();
-                }
-                if preset_config.temp.is_some() {
-                    base.temp = preset_config.temp;
-                }
-                if preset_config.max_tokens.is_some() {
-                    base.max_tokens = preset_config.max_tokens;
-                }
+                base.mode = preset_config.mode.clone().or(base.mode);
+                base.endpoint = preset_config.endpoint.clone().or(base.endpoint);
+                base.model = preset_config.model.clone().or(base.model);
+                base.api_key = preset_config.api_key.clone().or(base.api_key);
+                base.system = preset_config.system.clone().or(base.system);
+                base.temp = preset_config.temp.or(base.temp);
+                base.max_tokens = preset_config.max_tokens.or(base.max_tokens);
+                base.workspace = preset_config.workspace.clone().or(base.workspace);
+                base.mcp = preset_config.mcp.or(base.mcp);
+                base.tools = preset_config.tools.or(base.tools);
                 if !preset_config.mcp_servers.is_empty() {
                     base.mcp_servers = preset_config.mcp_servers.clone();
-                }
-                if preset_config.workspace.is_some() {
-                    base.workspace = preset_config.workspace.clone();
-                }
-                if preset_config.mcp.is_some() {
-                    base.mcp = preset_config.mcp;
-                }
-                if preset_config.tools.is_some() {
-                    base.tools = preset_config.tools;
                 }
             } else {
                 eprintln!("[rmux] Preset '{}' not found", preset_name);
@@ -462,9 +442,17 @@ impl LlmClient {
         });
     }
 
-    pub async fn get_conversation(&self) -> Vec<ChatMessage> {
-        self.conversations.read().await.clone()
+    // pub async fn get_conversation(&self) -> Vec<ChatMessage> {
+    //     self.conversations.read().await.clone()
+    // }
+
+    pub fn get_conversation(&self) -> Option<Vec<ChatMessage>> {
+        self.conversations.try_read().ok().map(|g| g.clone())
     }
+
+    // pub fn try_get_conversation(&self) -> Option<Vec<ChatMessage>> {
+    //     self.conversations.try_read().ok().map(|g| g.clone())
+    // }
 
     pub async fn save_conversation(&self) {
         if let Some(ref workspace) = self.config.workspace {
@@ -473,14 +461,79 @@ impl LlmClient {
         }
     }
 
-    pub async fn get_mcp_status(&self) -> Vec<(String, bool)> {
-        let mcp = self.mcp_manager.read().await;
-        mcp.connection_status()
+    pub fn get_mcp_status(&self) -> Option<Vec<(String, bool)>> {
+        self.mcp_manager.try_read().ok().map(|mcp| mcp.connection_status())
     }
 
     pub async fn disconnect_mcp(&self, server_name: &str) -> bool {
         let mut mcp = self.mcp_manager.write().await;
         mcp.disconnect_server(server_name)
+    }
+
+    fn process_stream_data<F>(
+        data: &str,
+        full_response: &mut String,
+        tool_calls: &mut Vec<ToolCall>,
+        on_event: &mut F,
+    ) where
+        F: FnMut(StreamEvent) + Send,
+    {
+        if let Ok(stream_response) = serde_json::from_str::<StreamResponse>(data) {
+            if let Some(choice) = stream_response.choices.first() {
+                if let Some(content) = &choice.delta.content {
+                    full_response.push_str(content);
+                    on_event(StreamEvent::Text(content.clone()));
+                }
+
+                if let Some(delta_tool_calls) = &choice.delta.tool_calls {
+                    for delta_tc in delta_tool_calls {
+                        if let Some(id) = &delta_tc.id {
+                            let name = delta_tc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.clone())
+                                .unwrap_or_default();
+                            let tool_type = delta_tc
+                                .tool_type
+                                .clone()
+                                .unwrap_or_else(|| "function".to_string());
+                            on_event(StreamEvent::ToolCallStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                            });
+                            tool_calls.push(ToolCall {
+                                id: id.clone(),
+                                tool_type,
+                                function: super::tools::FunctionCall {
+                                    name,
+                                    arguments: String::new(),
+                                },
+                            });
+                        }
+
+                        if let Some(args_delta) = delta_tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.arguments.as_ref())
+                        {
+                            on_event(StreamEvent::ToolCallDelta(args_delta.clone()));
+                            if let Some(last_tc) = tool_calls.last_mut() {
+                                last_tc.function.arguments.push_str(args_delta);
+                            }
+                        }
+                    }
+                }
+
+                if choice.finish_reason.is_some() {
+                    on_event(StreamEvent::ToolCallEnd);
+                }
+            }
+        } else if !data.is_empty() {
+            on_event(StreamEvent::Error(format!(
+                "Failed to parse stream: {}",
+                data
+            )));
+        }
     }
 
     fn build_headers(&self) -> reqwest::header::HeaderMap {
@@ -570,64 +623,12 @@ impl LlmClient {
                             break;
                         }
 
-                        if let Ok(stream_response) = serde_json::from_str::<StreamResponse>(data) {
-                            if let Some(choice) = stream_response.choices.first() {
-                                if let Some(content) = &choice.delta.content {
-                                    full_response.push_str(content);
-                                    on_event(StreamEvent::Text(content.clone()));
-                                }
-
-                                if let Some(delta_tool_calls) = &choice.delta.tool_calls {
-                                    for delta_tc in delta_tool_calls {
-                                        if let Some(id) = &delta_tc.id {
-                                            let name = delta_tc
-                                                .function
-                                                .as_ref()
-                                                .and_then(|f| f.name.clone())
-                                                .unwrap_or_default();
-                                            let tool_type = delta_tc
-                                                .tool_type
-                                                .clone()
-                                                .unwrap_or_else(|| "function".to_string());
-                                            on_event(StreamEvent::ToolCallStart {
-                                                id: id.clone(),
-                                                name: name.clone(),
-                                            });
-                                            tool_calls.push(ToolCall {
-                                                id: id.clone(),
-                                                tool_type,
-                                                function: super::tools::FunctionCall {
-                                                    name,
-                                                    arguments: String::new(),
-                                                },
-                                            });
-                                        }
-
-                                        if let Some(args_delta) = delta_tc
-                                            .function
-                                            .as_ref()
-                                            .and_then(|f| f.arguments.as_ref())
-                                        {
-                                            on_event(StreamEvent::ToolCallDelta(
-                                                args_delta.clone(),
-                                            ));
-                                            if let Some(last_tc) = tool_calls.last_mut() {
-                                                last_tc.function.arguments.push_str(args_delta);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if choice.finish_reason.is_some() {
-                                    on_event(StreamEvent::ToolCallEnd);
-                                }
-                            }
-                        } else if !data.is_empty() {
-                            on_event(StreamEvent::Error(format!(
-                                "Failed to parse stream: {}",
-                                data
-                            )));
-                        }
+                        Self::process_stream_data(
+                            data,
+                            &mut full_response,
+                            &mut tool_calls,
+                            &mut on_event,
+                        );
                     }
                 }
             }

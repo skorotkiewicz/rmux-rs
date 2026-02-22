@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use rmcp::model::Tool as McpTool;
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransport;
@@ -60,7 +59,7 @@ impl Service<RoleClient> for ClientHandler {
 pub struct McpConnection {
     pub name: String,
     pub peer: Peer<RoleClient>,
-    pub tools: Vec<McpTool>,
+    pub tools: Vec<Tool>,
     pub service: RunningService<RoleClient, ClientHandler>,
 }
 
@@ -89,7 +88,19 @@ impl McpConnection {
         let peer = running_service.peer().clone();
 
         let tools_result = peer.list_tools(None).await?;
-        let tools = tools_result.tools;
+        let mcp_tools = tools_result.tools;
+
+        let tools = mcp_tools
+            .iter()
+            .map(|tool| Tool {
+                tool_type: "function".to_string(),
+                function: super::tools::ToolFunction {
+                    name: format!("mcp_{}_{}", name, tool.name),
+                    description: tool.description.clone().unwrap_or_default().to_string(),
+                    parameters: serde_json::Value::Object(tool.input_schema.as_ref().clone()),
+                },
+            })
+            .collect();
 
         Ok(Self {
             name,
@@ -106,7 +117,19 @@ impl McpConnection {
         let peer = running_service.peer().clone();
 
         let tools_result = peer.list_tools(None).await?;
-        let tools = tools_result.tools;
+        let mcp_tools = tools_result.tools;
+
+        let tools = mcp_tools
+            .iter()
+            .map(|tool| Tool {
+                tool_type: "function".to_string(),
+                function: super::tools::ToolFunction {
+                    name: format!("mcp_{}_{}", name, tool.name),
+                    description: tool.description.clone().unwrap_or_default().to_string(),
+                    parameters: serde_json::Value::Object(tool.input_schema.as_ref().clone()),
+                },
+            })
+            .collect();
 
         Ok(Self {
             name,
@@ -127,17 +150,7 @@ impl McpConnection {
     }
 
     pub fn get_tools(&self) -> Vec<Tool> {
-        self.tools
-            .iter()
-            .map(|tool| Tool {
-                tool_type: "function".to_string(),
-                function: super::tools::ToolFunction {
-                    name: format!("mcp_{}_{}", self.name, tool.name),
-                    description: tool.description.clone().unwrap_or_default().to_string(),
-                    parameters: serde_json::Value::Object(tool.input_schema.as_ref().clone()),
-                },
-            })
-            .collect()
+        self.tools.clone()
     }
 
     pub async fn execute_tool(&self, tool_name: &str, arguments: &str) -> Result<String> {

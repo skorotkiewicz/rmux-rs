@@ -2,7 +2,7 @@
 
 Terminal multiplexer with AI chat, built with Rust and egui.
 
-![rmux-rs](docs/rmux-rs-1.png)
+![rmux-rs](docs/rmux-rs.png)
 
 ## Features
 

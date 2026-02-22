@@ -5,6 +5,8 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransport;
 use rmcp::{Peer, RoleClient, Service, serve_client};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::tools::Tool;
 
@@ -61,6 +63,22 @@ pub struct McpConnection {
     pub peer: Peer<RoleClient>,
     pub tools: Vec<Tool>,
     pub service: RunningService<RoleClient, ClientHandler>,
+    alive: Arc<AtomicBool>,
+}
+
+fn map_mcp_tools(name: &str, tools_result: &rmcp::model::ListToolsResult) -> Vec<Tool> {
+    tools_result
+        .tools
+        .iter()
+        .map(|tool| Tool {
+            tool_type: "function".to_string(),
+            function: super::tools::ToolFunction {
+                name: format!("mcp::{}::{}", name, tool.name),
+                description: tool.description.clone().unwrap_or_default().to_string(),
+                parameters: serde_json::Value::Object(tool.input_schema.as_ref().clone()),
+            },
+        })
+        .collect()
 }
 
 impl McpConnection {
@@ -88,25 +106,14 @@ impl McpConnection {
         let peer = running_service.peer().clone();
 
         let tools_result = peer.list_tools(None).await?;
-        let mcp_tools = tools_result.tools;
-
-        let tools = mcp_tools
-            .iter()
-            .map(|tool| Tool {
-                tool_type: "function".to_string(),
-                function: super::tools::ToolFunction {
-                    name: format!("mcp_{}_{}", name, tool.name),
-                    description: tool.description.clone().unwrap_or_default().to_string(),
-                    parameters: serde_json::Value::Object(tool.input_schema.as_ref().clone()),
-                },
-            })
-            .collect();
+        let tools = map_mcp_tools(&name, &tools_result);
 
         Ok(Self {
             name,
             peer,
             tools,
             service: running_service,
+            alive: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -117,33 +124,23 @@ impl McpConnection {
         let peer = running_service.peer().clone();
 
         let tools_result = peer.list_tools(None).await?;
-        let mcp_tools = tools_result.tools;
-
-        let tools = mcp_tools
-            .iter()
-            .map(|tool| Tool {
-                tool_type: "function".to_string(),
-                function: super::tools::ToolFunction {
-                    name: format!("mcp_{}_{}", name, tool.name),
-                    description: tool.description.clone().unwrap_or_default().to_string(),
-                    parameters: serde_json::Value::Object(tool.input_schema.as_ref().clone()),
-                },
-            })
-            .collect();
+        let tools = map_mcp_tools(&name, &tools_result);
 
         Ok(Self {
             name,
             peer,
             tools,
             service: running_service,
+            alive: Arc::new(AtomicBool::new(true)),
         })
     }
 
     pub fn is_running(&self) -> bool {
-        true
+        self.alive.load(Ordering::Relaxed)
     }
 
     pub fn shutdown(self) {
+        self.alive.store(false, Ordering::Relaxed);
         tokio::spawn(async move {
             let _ = self.service.cancel().await;
         });
@@ -266,7 +263,8 @@ impl McpManager {
     }
 
     pub async fn execute_tool(&self, full_name: &str, arguments: &str) -> Result<String> {
-        let parts: Vec<&str> = full_name.splitn(3, '_').collect();
+        // Tool names use "mcp::server::tool" format
+        let parts: Vec<&str> = full_name.splitn(3, "::").collect();
         if parts.len() < 3 {
             return Err(anyhow!("Invalid MCP tool name format: {}", full_name));
         }
@@ -284,7 +282,7 @@ impl McpManager {
     }
 
     pub fn is_mcp_tool(&self, tool_name: &str) -> bool {
-        tool_name.starts_with("mcp_")
+        tool_name.starts_with("mcp::")
     }
 
     pub fn connection_status(&self) -> Vec<(String, bool)> {

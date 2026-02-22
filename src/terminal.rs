@@ -396,7 +396,10 @@ impl TerminalPane {
                 });
             });
 
-        ui.ctx().request_repaint();
+        // Only repaint continuously when there's a pending response
+        if tab.terminal_state.pending.is_some() {
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -442,19 +445,20 @@ fn render_box(
                 );
             });
 
-            for line in content.lines().take(20) {
+            let lines: Vec<&str> = content.lines().collect();
+            for line in lines.iter().take(20) {
                 ui.label(
-                    egui::RichText::new(line)
+                    egui::RichText::new(*line)
                         .font(egui::FontId::monospace(11.0))
                         .color(Color32::from_rgb(200, 200, 200)),
                 );
             }
 
-            if content.lines().count() > 20 {
+            if lines.len() > 20 {
                 ui.label(
                     egui::RichText::new(format!(
                         "... ({} more lines)",
-                        content.lines().count() - 20
+                        lines.len() - 20
                     ))
                     .font(egui::FontId::monospace(10.0))
                     .color(Color32::from_rgb(150, 150, 150))

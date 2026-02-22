@@ -315,31 +315,46 @@ impl ToolExecutor {
                     .as_str()
                     .ok_or_else(|| anyhow!("Missing command"))?;
 
-                let output = tokio::process::Command::new("sh")
+                let fut = tokio::process::Command::new("sh")
                     .arg("-c")
                     .arg(command)
                     .current_dir(&self.workspace)
-                    .output()
-                    .await
-                    .map_err(|e| anyhow!("Failed to execute command: {}", e))?;
+                    .output();
+
+                let output = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    fut,
+                )
+                .await
+                .map_err(|_| anyhow!("Command timed out after 60 seconds"))?
+                .map_err(|e| anyhow!("Failed to execute command: {}", e))?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
+
+                // Limit output size to 50KB
+                let truncate = |s: &str| -> String {
+                    if s.len() > 50_000 {
+                        format!("{}...\n[truncated, {} bytes total]", &s[..50_000], s.len())
+                    } else {
+                        s.to_string()
+                    }
+                };
 
                 if output.status.success() {
                     if stdout.is_empty() && stderr.is_empty() {
                         Ok("Command executed successfully (no output)".to_string())
                     } else if stdout.is_empty() {
-                        Ok(format!("stderr:\n{}", stderr))
+                        Ok(format!("stderr:\n{}", truncate(&stderr)))
                     } else {
-                        Ok(stdout.to_string())
+                        Ok(truncate(&stdout))
                     }
                 } else {
                     Ok(format!(
                         "Command exited with code {:?}\nstdout: {}\nstderr: {}",
                         output.status.code(),
-                        stdout,
-                        stderr
+                        truncate(&stdout),
+                        truncate(&stderr),
                     ))
                 }
             }

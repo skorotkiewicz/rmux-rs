@@ -326,6 +326,7 @@ pub struct LlmClient {
     tool_executor: Option<ToolExecutor>,
     mcp_manager: Arc<RwLock<McpManager>>,
     agent_context: Option<AgentContext>,
+    cached_headers: reqwest::header::HeaderMap,
 }
 
 impl LlmClient {
@@ -341,6 +342,18 @@ impl LlmClient {
 
         let agent_context = config.workspace.as_ref().map(|ws| AgentContext::load(ws));
 
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        if let Some(ref api_key) = config.api_key {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", api_key).parse().unwrap(),
+            );
+        }
+
         Self {
             client: Client::new(),
             config,
@@ -349,19 +362,16 @@ impl LlmClient {
             tool_executor,
             mcp_manager: Arc::new(RwLock::new(McpManager::new())),
             agent_context,
+            cached_headers: headers,
         }
     }
 
-    pub fn from_config(config: Config) -> Self {
-        Self::new(config)
-    }
-
     pub fn default_client() -> Self {
-        Self::from_config(Config::load())
+        Self::new(Config::load())
     }
 
     pub fn with_preset(preset: &str) -> Self {
-        Self::from_config(Config::load_with_preset(Some(preset)))
+        Self::new(Config::load_with_preset(Some(preset)))
     }
 
     pub fn get_workspace(&self) -> Option<&PathBuf> {
@@ -442,17 +452,9 @@ impl LlmClient {
         });
     }
 
-    // pub async fn get_conversation(&self) -> Vec<ChatMessage> {
-    //     self.conversations.read().await.clone()
-    // }
-
     pub fn get_conversation(&self) -> Option<Vec<ChatMessage>> {
         self.conversations.try_read().ok().map(|g| g.clone())
     }
-
-    // pub fn try_get_conversation(&self) -> Option<Vec<ChatMessage>> {
-    //     self.conversations.try_read().ok().map(|g| g.clone())
-    // }
 
     pub async fn save_conversation(&self) {
         if let Some(ref workspace) = self.config.workspace {
@@ -524,7 +526,7 @@ impl LlmClient {
                     }
                 }
 
-                if choice.finish_reason.is_some() {
+                if choice.finish_reason.is_some() && !tool_calls.is_empty() {
                     on_event(StreamEvent::ToolCallEnd);
                 }
             }
@@ -536,19 +538,8 @@ impl LlmClient {
         }
     }
 
-    fn build_headers(&self) -> reqwest::header::HeaderMap {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            "application/json".parse().unwrap(),
-        );
-        if let Some(ref api_key) = self.config.api_key {
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", api_key).parse().unwrap(),
-            );
-        }
-        headers
+    fn build_headers(&self) -> &reqwest::header::HeaderMap {
+        &self.cached_headers
     }
 
     pub async fn send_message_stream<F>(
@@ -559,15 +550,17 @@ impl LlmClient {
     where
         F: FnMut(StreamEvent) + Send,
     {
-        let mut messages = self.conversations.write().await;
-
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: Some(user_message.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        });
+        // Push user message with a brief lock
+        {
+            let mut messages = self.conversations.write().await;
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(user_message.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
 
         let mut full_response = String::new();
         let tools_guard = self.tools.read().await;
@@ -579,9 +572,14 @@ impl LlmClient {
         drop(tools_guard);
 
         loop {
+            let messages_snapshot = {
+                let messages = self.conversations.read().await;
+                messages.clone()
+            };
+
             let request = ChatRequest {
                 model: self.config.model.clone(),
-                messages: messages.clone(),
+                messages: messages_snapshot,
                 temperature: self.config.temp,
                 max_tokens: self.config.max_tokens,
                 stream: true,
@@ -593,7 +591,7 @@ impl LlmClient {
             let response = self
                 .client
                 .post(&url)
-                .headers(self.build_headers())
+                .headers(self.build_headers().clone())
                 .json(&request)
                 .send()
                 .await
@@ -613,12 +611,16 @@ impl LlmClient {
                 let chunk_str = String::from_utf8_lossy(&chunk);
                 buffer.push_str(&chunk_str);
 
-                while let Some(pos) = buffer.find("\n\n") {
-                    let message = buffer[..pos].to_string();
-                    buffer = buffer[pos + 2..].to_string();
+                // Parse SSE: split by line, accumulate data lines, emit on blank
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim_end().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
 
-                    if message.starts_with("data: ") {
-                        let data = &message[6..];
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
                             break;
                         }
@@ -633,6 +635,9 @@ impl LlmClient {
                 }
             }
 
+            // Acquire lock briefly to push results
+            let mut messages = self.conversations.write().await;
+
             if tool_calls.is_empty() {
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
@@ -645,6 +650,7 @@ impl LlmClient {
                     tool_call_id: None,
                     name: None,
                 });
+                drop(messages);
                 break;
             }
 
@@ -655,6 +661,7 @@ impl LlmClient {
                 tool_call_id: None,
                 name: None,
             });
+            drop(messages);
 
             for tc in &tool_calls {
                 let tool_name = &tc.function.name;
@@ -689,6 +696,7 @@ impl LlmClient {
                     result: tool_result.clone(),
                 });
 
+                let mut messages = self.conversations.write().await;
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(tool_result),
@@ -698,8 +706,6 @@ impl LlmClient {
                 });
             }
         }
-
-        drop(messages);
 
         self.save_conversation().await;
 

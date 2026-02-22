@@ -1,6 +1,5 @@
 use crate::ai::llm_client::{ChatMessage, LlmClient, StreamEvent};
 use crate::app::Tab;
-use crate::notification::NotificationStore;
 use eframe::egui::{self, Color32, TextEdit};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -47,19 +46,19 @@ impl PendingResponse {
             notified: Arc::new(AtomicBool::new(false)),
         }
     }
-    
+
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
     }
-    
+
     pub fn should_notify(&self) -> bool {
         self.is_ready() && !self.notified.load(Ordering::Relaxed)
     }
-    
+
     pub fn mark_notified(&self) {
         self.notified.store(true, Ordering::Relaxed);
     }
-    
+
     pub fn get_assistant_content(&self) -> Option<String> {
         if let Ok(conv) = self.conversation.read() {
             for msg in conv.iter().rev() {
@@ -74,7 +73,7 @@ impl PendingResponse {
         }
         None
     }
-    
+
     pub fn get_error(&self) -> Option<String> {
         self.error.read().ok().and_then(|e| e.clone())
     }
@@ -110,9 +109,7 @@ impl TerminalPane {
     pub fn show(
         ui: &mut egui::Ui,
         tab: &mut Tab,
-        notifications: &mut NotificationStore,
         llm_client: Arc<LlmClient>,
-        _is_focused: bool,
     ) {
         ui.horizontal(|ui| {
             if ui.small_button("🗑").clicked() {
@@ -128,13 +125,6 @@ impl TerminalPane {
                     tab.terminal_state.messages.clear();
                     tab.terminal_state.history_loaded = true;
                     tab.terminal_state.show_clear_confirm = false;
-                    notifications.add_notification(
-                        tab.workspace_id,
-                        tab.id,
-                        "History Cleared",
-                        "",
-                        "Conversation history has been cleared.",
-                    );
                 }
                 if ui.small_button("No").clicked() {
                     tab.terminal_state.show_clear_confirm = false;

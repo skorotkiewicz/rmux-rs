@@ -716,12 +716,10 @@ impl eframe::App for RmuxApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(workspace_id) = self.current_workspace {
                 if let Some(dock_state) = self.dock_states.get_mut(&workspace_id) {
-                    let focused_tab_id = dock_state.find_active_focused().map(|(_, tab)| tab.id);
                     DockArea::new(dock_state).show_inside(
                         ui,
                         &mut TabViewerImpl {
                             notifications: &mut self.notifications,
-                            focused_tab_id,
                         },
                     );
                 }
@@ -732,7 +730,6 @@ impl eframe::App for RmuxApp {
 
 struct TabViewerImpl<'a> {
     notifications: &'a mut NotificationStore,
-    focused_tab_id: Option<Uuid>,
 }
 
 impl TabViewer for TabViewerImpl<'_> {
@@ -752,16 +749,9 @@ impl TabViewer for TabViewerImpl<'_> {
             self.notifications.mark_read_for_tab(tab.id);
             tab.has_notification = false;
         }
-        let is_focused = self.focused_tab_id == Some(tab.id);
         match tab.pane_type {
             PaneType::Terminal => {
-                TerminalPane::show(
-                    ui,
-                    tab,
-                    self.notifications,
-                    tab.llm_client.clone(),
-                    is_focused,
-                );
+                TerminalPane::show(ui, tab, tab.llm_client.clone());
             }
             PaneType::Browser => {
                 ui.vertical(|ui| {

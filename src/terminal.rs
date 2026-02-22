@@ -155,8 +155,10 @@ impl TerminalPane {
         }
 
         egui::ScrollArea::vertical()
+            .hscroll(false)
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 ui.style_mut().visuals.extreme_bg_color = Color32::from_rgb(20, 20, 25);
 
                 if tab.terminal_state.messages.is_empty() {
@@ -284,37 +286,83 @@ impl TerminalPane {
                             }
                         }
                         tab.terminal_state.pending = None;
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                egui::RichText::new("Thinking...")
-                                    .font(egui::FontId::monospace(12.0))
-                                    .color(Color32::from_rgb(150, 150, 150))
-                                    .italics(),
-                            );
-                        });
                     }
                 }
 
+                // Input area
+                let is_pending = tab.terminal_state.pending.is_some();
+
+                // Cancel button when request is pending
+                if is_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Thinking...")
+                                .font(egui::FontId::monospace(12.0))
+                                .color(Color32::from_rgb(150, 150, 150))
+                                .italics(),
+                        );
+                    });
+                }
+
+                // Check if Enter was pressed (without Shift) to send
+                let enter_pressed = ui.input(|i| {
+                    i.key_pressed(egui::Key::Enter)
+                        && !i.modifiers.shift
+                });
+
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(">")
-                            .font(egui::FontId::monospace(13.0))
-                            .color(Color32::from_rgb(100, 255, 100)),
-                    );
+                    // ui.label(
+                    //     egui::RichText::new(">")
+                    //         .font(egui::FontId::monospace(13.0))
+                    //         .color(Color32::from_rgb(100, 255, 100)),
+                    // );
 
                     let response = ui.add(
-                        TextEdit::singleline(&mut tab.terminal_state.input)
-                            .desired_width(f32::INFINITY)
+                        TextEdit::multiline(&mut tab.terminal_state.input)
+                            .desired_width(ui.available_width() - 60.0)
+                            .desired_rows(2)
                             .font(egui::FontId::monospace(13.0))
-                            .text_color(Color32::from_rgb(220, 220, 220)),
+                            .text_color(Color32::from_rgb(220, 220, 220))
+                            .lock_focus(true),
                     );
 
-                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if !tab.terminal_state.input.trim().is_empty()
-                            && tab.terminal_state.pending.is_none()
+                    // Send/Cancel button
+                    let should_send = if is_pending {
+                        if ui
+                            .button(
+                                egui::RichText::new(format!("{}", regular::STOP))
+                                    .color(Color32::from_rgb(255, 100, 100)),
+                            )
+                            .clicked()
                         {
+                            if let Some(handle) = &tab.abort_handle {
+                                handle.abort();
+                            }
+                            tab.terminal_state.pending = None;
+                            tab.terminal_state
+                                .messages
+                                .push(TerminalMessage::Error("Request cancelled.".to_string()));
+                        }
+                        false
+                    } else {
+                        ui.button(
+                            egui::RichText::new(format!("{}", regular::PAPER_PLANE_RIGHT))
+                                .color(Color32::from_rgb(100, 255, 100)),
+                        )
+                        .clicked()
+                    };
+
+                    // Enter sends, Shift+Enter inserts newline
+                    let trigger_send = (enter_pressed && response.has_focus()) || should_send;
+
+                    if trigger_send {
+                        // Remove the newline that Enter just inserted
+                        if tab.terminal_state.input.ends_with('\n') {
+                            tab.terminal_state.input.pop();
+                        }
+
+                        if !tab.terminal_state.input.trim().is_empty() && !is_pending {
                             let user_msg = tab.terminal_state.input.trim().to_string();
                             tab.terminal_state
                                 .messages
@@ -329,7 +377,7 @@ impl TerminalPane {
                             let error_arc = pending.error.clone();
                             let client = llm_client.clone();
 
-                            tokio::spawn(async move {
+                            let handle = tokio::spawn(async move {
                                 let result = client
                                     .send_message_stream(&user_msg, |event| {
                                         let ui_event = match event {
@@ -372,6 +420,7 @@ impl TerminalPane {
                                 ready.store(true, Ordering::Relaxed);
                             });
 
+                            tab.abort_handle = Some(handle.abort_handle());
                             tab.terminal_state.pending = Some(pending);
                         }
                         response.request_focus();
@@ -399,10 +448,13 @@ fn render_message_header(ui: &mut egui::Ui, label: &str, color: Color32) {
 
 fn render_content(ui: &mut egui::Ui, content: &str, color: Color32) {
     for line in content.lines() {
-        ui.label(
-            egui::RichText::new(line)
-                .font(egui::FontId::monospace(12.0))
-                .color(color),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(line)
+                    .font(egui::FontId::monospace(12.0))
+                    .color(color),
+            )
+            .wrap(),
         );
     }
 }
@@ -430,10 +482,13 @@ fn render_box(
 
             let lines: Vec<&str> = content.lines().collect();
             for line in lines.iter().take(20) {
-                ui.label(
-                    egui::RichText::new(*line)
-                        .font(egui::FontId::monospace(11.0))
-                        .color(Color32::from_rgb(200, 200, 200)),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(*line)
+                            .font(egui::FontId::monospace(11.0))
+                            .color(Color32::from_rgb(200, 200, 200)),
+                    )
+                    .wrap(),
                 );
             }
 

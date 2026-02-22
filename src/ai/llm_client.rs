@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -25,8 +25,6 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
-    #[serde(default)]
-    pub mode: Option<String>,
     #[serde(default)]
     pub endpoint: String,
     #[serde(default)]
@@ -178,8 +176,9 @@ impl Config {
         }
 
         Self {
-            mode: base.mode,
-            endpoint: base.endpoint.unwrap_or_else(|| "http://localhost:8080/v1".to_string()),
+            endpoint: base
+                .endpoint
+                .unwrap_or_else(|| "http://localhost:8080/v1".to_string()),
             model: base.model.unwrap_or_else(|| "default".to_string()),
             api_key: base.api_key,
             system: base.system,
@@ -237,11 +236,21 @@ struct DeltaFunction {
 
 pub enum StreamEvent {
     Text(String),
-    ToolCallStart { id: String, name: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
     ToolCallDelta(String),
     ToolCallEnd,
-    ToolExecuting { name: String, arguments: String },
-    ToolResult { name: String, result: String },
+    ToolExecuting {
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        result: String,
+    },
     Done,
     Error(String),
 }
@@ -342,14 +351,15 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(config: Config) -> Self {
         let tool_executor = if config.tools && config.workspace.is_some() {
-            config.workspace.as_ref().map(|ws| ToolExecutor::new(ws.clone()))
+            config
+                .workspace
+                .as_ref()
+                .map(|ws| ToolExecutor::new(ws.clone()))
         } else {
             None
         };
 
-        let agent_context = config.workspace.as_ref().map(|ws| {
-            AgentContext::load(ws)
-        });
+        let agent_context = config.workspace.as_ref().map(|ws| AgentContext::load(ws));
 
         Self {
             client: Client::new(),
@@ -379,9 +389,11 @@ impl LlmClient {
     }
 
     fn build_system_prompt(&self) -> String {
-        let mut prompt = self.config.system.clone().unwrap_or_else(|| {
-            "You are a helpful assistant.".to_string()
-        });
+        let mut prompt = self
+            .config
+            .system
+            .clone()
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
 
         if let Some(ref agent) = self.agent_context {
             if agent.has_content() {
@@ -461,6 +473,16 @@ impl LlmClient {
         }
     }
 
+    pub async fn get_mcp_status(&self) -> Vec<(String, bool)> {
+        let mcp = self.mcp_manager.read().await;
+        mcp.connection_status()
+    }
+
+    pub async fn disconnect_mcp(&self, server_name: &str) -> bool {
+        let mut mcp = self.mcp_manager.write().await;
+        mcp.disconnect_server(server_name)
+    }
+
     fn build_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -476,7 +498,11 @@ impl LlmClient {
         headers
     }
 
-    pub async fn send_message_stream<F>(&self, user_message: &str, mut on_event: F) -> Result<String>
+    pub async fn send_message_stream<F>(
+        &self,
+        user_message: &str,
+        mut on_event: F,
+    ) -> Result<String>
     where
         F: FnMut(StreamEvent) + Send,
     {
@@ -559,13 +585,17 @@ impl LlmClient {
                                                 .as_ref()
                                                 .and_then(|f| f.name.clone())
                                                 .unwrap_or_default();
+                                            let tool_type = delta_tc
+                                                .tool_type
+                                                .clone()
+                                                .unwrap_or_else(|| "function".to_string());
                                             on_event(StreamEvent::ToolCallStart {
                                                 id: id.clone(),
                                                 name: name.clone(),
                                             });
                                             tool_calls.push(ToolCall {
                                                 id: id.clone(),
-                                                tool_type: "function".to_string(),
+                                                tool_type,
                                                 function: super::tools::FunctionCall {
                                                     name,
                                                     arguments: String::new(),
@@ -578,7 +608,9 @@ impl LlmClient {
                                             .as_ref()
                                             .and_then(|f| f.arguments.as_ref())
                                         {
-                                            on_event(StreamEvent::ToolCallDelta(args_delta.clone()));
+                                            on_event(StreamEvent::ToolCallDelta(
+                                                args_delta.clone(),
+                                            ));
                                             if let Some(last_tc) = tool_calls.last_mut() {
                                                 last_tc.function.arguments.push_str(args_delta);
                                             }
@@ -590,6 +622,11 @@ impl LlmClient {
                                     on_event(StreamEvent::ToolCallEnd);
                                 }
                             }
+                        } else if !data.is_empty() {
+                            on_event(StreamEvent::Error(format!(
+                                "Failed to parse stream: {}",
+                                data
+                            )));
                         }
                     }
                 }
@@ -646,6 +683,7 @@ impl LlmClient {
                 };
 
                 on_event(StreamEvent::ToolResult {
+                    id: tc.id.clone(),
                     name: tool_name.clone(),
                     result: tool_result.clone(),
                 });
@@ -662,10 +700,7 @@ impl LlmClient {
 
         drop(messages);
 
-        if let Some(ref workspace) = self.config.workspace {
-            let msgs = self.conversations.read().await;
-            save_history(workspace, &msgs);
-        }
+        self.save_conversation().await;
 
         on_event(StreamEvent::Done);
         Ok(full_response)

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -190,7 +190,9 @@ impl ToolExecutor {
 
         match name {
             "read_file" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("Missing path"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing path"))?;
                 let full_path = self.validate_path(path)?;
 
                 let content = tokio::fs::read_to_string(&full_path)
@@ -200,8 +202,12 @@ impl ToolExecutor {
                 Ok(format!("File contents of {}:\n\n{}", path, content))
             }
             "write_file" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("Missing path"))?;
-                let content = args["content"].as_str().ok_or_else(|| anyhow!("Missing content"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing path"))?;
+                let content = args["content"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing content"))?;
                 let full_path = self.validate_path(path)?;
 
                 if let Some(parent) = full_path.parent() {
@@ -212,10 +218,16 @@ impl ToolExecutor {
                     .await
                     .map_err(|e| anyhow!("Failed to write file {}: {}", path, e))?;
 
-                Ok(format!("Successfully wrote {} bytes to {}", content.len(), path))
+                Ok(format!(
+                    "Successfully wrote {} bytes to {}",
+                    content.len(),
+                    path
+                ))
             }
             "list_directory" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("Missing path"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing path"))?;
                 let full_path = self.validate_path(path)?;
 
                 let mut entries = tokio::fs::read_dir(&full_path)
@@ -252,7 +264,9 @@ impl ToolExecutor {
                 Ok(result)
             }
             "create_directory" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("Missing path"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing path"))?;
                 let full_path = self.validate_path(path)?;
 
                 tokio::fs::create_dir_all(&full_path)
@@ -262,9 +276,15 @@ impl ToolExecutor {
                 Ok(format!("Successfully created directory {}", path))
             }
             "edit_file" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("Missing path"))?;
-                let old_text = args["old_text"].as_str().ok_or_else(|| anyhow!("Missing old_text"))?;
-                let new_text = args["new_text"].as_str().ok_or_else(|| anyhow!("Missing new_text"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing path"))?;
+                let old_text = args["old_text"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing old_text"))?;
+                let new_text = args["new_text"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing new_text"))?;
                 let full_path = self.validate_path(path)?;
 
                 let content = tokio::fs::read_to_string(&full_path)
@@ -272,7 +292,10 @@ impl ToolExecutor {
                     .map_err(|e| anyhow!("Failed to read file {}: {}", path, e))?;
 
                 if !content.contains(old_text) {
-                    return Err(anyhow!("Could not find the text to replace in file {}", path));
+                    return Err(anyhow!(
+                        "Could not find the text to replace in file {}",
+                        path
+                    ));
                 }
 
                 let occurrences = content.matches(old_text).count();
@@ -282,11 +305,16 @@ impl ToolExecutor {
                     .await
                     .map_err(|e| anyhow!("Failed to write file {}: {}", path, e))?;
 
-                Ok(format!("Successfully replaced {} occurrence(s) in {}", occurrences, path))
+                Ok(format!(
+                    "Successfully replaced {} occurrence(s) in {}",
+                    occurrences, path
+                ))
             }
             "execute" => {
-                let command = args["command"].as_str().ok_or_else(|| anyhow!("Missing command"))?;
-                
+                let command = args["command"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("Missing command"))?;
+
                 let output = tokio::process::Command::new("sh")
                     .arg("-c")
                     .arg(command)

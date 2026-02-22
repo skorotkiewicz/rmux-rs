@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rmcp::model::Tool as McpTool;
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
@@ -61,8 +61,7 @@ pub struct McpConnection {
     pub name: String,
     pub peer: Peer<RoleClient>,
     pub tools: Vec<McpTool>,
-    #[allow(dead_code)]
-    service: RunningService<RoleClient, ClientHandler>,
+    pub service: RunningService<RoleClient, ClientHandler>,
 }
 
 impl McpConnection {
@@ -115,6 +114,16 @@ impl McpConnection {
             tools,
             service: running_service,
         })
+    }
+
+    pub fn is_running(&self) -> bool {
+        true
+    }
+
+    pub fn shutdown(self) {
+        tokio::spawn(async move {
+            let _ = self.service.cancel().await;
+        });
     }
 
     pub fn get_tools(&self) -> Vec<Tool> {
@@ -202,10 +211,9 @@ impl McpManager {
                     McpConnection::connect_remote(server_name.clone(), url.clone()).await
                 }
                 _ => {
-                    let command = server_config
-                        .command
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("Local MCP server {} missing command", server_name))?;
+                    let command = server_config.command.as_ref().ok_or_else(|| {
+                        anyhow!("Local MCP server {} missing command", server_name)
+                    })?;
                     McpConnection::connect_local(
                         server_name.clone(),
                         command.clone(),
@@ -226,7 +234,10 @@ impl McpManager {
                     self.connections.push(conn);
                 }
                 Err(e) => {
-                    eprintln!("[rmux] Failed to connect to MCP server '{}': {}", server_name, e);
+                    eprintln!(
+                        "[rmux] Failed to connect to MCP server '{}': {}",
+                        server_name, e
+                    );
                 }
             }
         }
@@ -235,7 +246,10 @@ impl McpManager {
     }
 
     pub fn get_all_tools(&self) -> Vec<Tool> {
-        self.connections.iter().flat_map(|c| c.get_tools()).collect()
+        self.connections
+            .iter()
+            .flat_map(|c| c.get_tools())
+            .collect()
     }
 
     pub async fn execute_tool(&self, full_name: &str, arguments: &str) -> Result<String> {
@@ -258,6 +272,24 @@ impl McpManager {
 
     pub fn is_mcp_tool(&self, tool_name: &str) -> bool {
         tool_name.starts_with("mcp_")
+    }
+
+    pub fn connection_status(&self) -> Vec<(String, bool)> {
+        self.connections
+            .iter()
+            .map(|c| (c.name.clone(), c.is_running()))
+            .collect()
+    }
+
+    pub fn disconnect_server(&mut self, server_name: &str) -> bool {
+        let idx = self.connections.iter().position(|c| c.name == server_name);
+        if let Some(i) = idx {
+            let conn = self.connections.remove(i);
+            conn.shutdown();
+            true
+        } else {
+            false
+        }
     }
 }
 

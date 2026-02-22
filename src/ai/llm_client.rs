@@ -216,11 +216,8 @@ struct DeltaFunction {
 
 pub enum StreamEvent {
     Text(String),
-    ToolCallStart {
-        id: String,
-        name: String,
-    },
-    ToolCallDelta(String),
+    ToolCallStart,
+    ToolCallDelta,
     ToolCallEnd,
     ToolExecuting {
         name: String,
@@ -499,10 +496,7 @@ impl LlmClient {
                                 .tool_type
                                 .clone()
                                 .unwrap_or_else(|| "function".to_string());
-                            on_event(StreamEvent::ToolCallStart {
-                                id: id.clone(),
-                                name: name.clone(),
-                            });
+                            on_event(StreamEvent::ToolCallStart);
                             tool_calls.push(ToolCall {
                                 id: id.clone(),
                                 tool_type,
@@ -518,7 +512,7 @@ impl LlmClient {
                             .as_ref()
                             .and_then(|f| f.arguments.as_ref())
                         {
-                            on_event(StreamEvent::ToolCallDelta(args_delta.clone()));
+                            on_event(StreamEvent::ToolCallDelta);
                             if let Some(last_tc) = tool_calls.last_mut() {
                                 last_tc.function.arguments.push_str(args_delta);
                             }
@@ -672,21 +666,32 @@ impl LlmClient {
                     arguments: tool_args.clone(),
                 });
 
-                let result = if let Some(ref executor) = self.tool_executor {
-                    executor.execute(tool_name, tool_args).await
-                } else {
-                    Err(anyhow!("Tool not available"))
-                };
-
-                let tool_result = match result {
-                    Ok(r) => r,
-                    Err(_) => {
-                        let mcp = self.mcp_manager.read().await;
-                        if mcp.is_mcp_tool(tool_name) {
-                            mcp.execute_tool(tool_name, tool_args).await?
-                        } else {
-                            "Tool not available. Enable tools in config.".to_string()
+                let tool_result = if let Some(ref executor) = self.tool_executor {
+                    match executor.execute(tool_name, tool_args).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // If local executor doesn't know this tool, try MCP
+                            let mcp = self.mcp_manager.read().await;
+                            if mcp.is_mcp_tool(tool_name) {
+                                match mcp.execute_tool(tool_name, tool_args).await {
+                                    Ok(r) => r,
+                                    Err(e) => format!("Error: {}", e),
+                                }
+                            } else {
+                                // Real execution error (e.g. file not found) — return it
+                                format!("Error: {}", e)
+                            }
                         }
+                    }
+                } else {
+                    let mcp = self.mcp_manager.read().await;
+                    if mcp.is_mcp_tool(tool_name) {
+                        match mcp.execute_tool(tool_name, tool_args).await {
+                            Ok(r) => r,
+                            Err(e) => format!("Error: {}", e),
+                        }
+                    } else {
+                        "Tool not available. Enable tools in config.".to_string()
                     }
                 };
 

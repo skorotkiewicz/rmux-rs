@@ -10,11 +10,7 @@ pub struct TerminalPane;
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     Text(String),
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: String,
-    },
+    ToolCall,
     ToolExecuting {
         name: String,
         arguments: String,
@@ -241,17 +237,8 @@ impl TerminalPane {
                                         .messages
                                         .push(TerminalMessage::Assistant(text));
                                 }
-                                UiEvent::ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                } => {
-                                    let title = if id.is_empty() {
-                                        format!("Tool: {}", name)
-                                    } else {
-                                        format!("Tool: {} [{}]", name, &id[..id.len().min(8)])
-                                    };
-                                    tab.terminal_state.messages.push(TerminalMessage::ToolCall { title, arguments });
+                                UiEvent::ToolCall => {
+                                    // Suppressed: ToolExecuting shows the complete tool call
                                 }
                                 UiEvent::ToolResult { id, name, result } => {
                                     let truncated = if result.len() > 500 {
@@ -347,15 +334,11 @@ impl TerminalPane {
                                     .send_message_stream(&user_msg, |event| {
                                         let ui_event = match event {
                                             StreamEvent::Text(t) => UiEvent::Text(t),
-                                            StreamEvent::ToolCallStart { id, name } => {
-                                                UiEvent::ToolCall {
-                                                    id,
-                                                    name,
-                                                    arguments: String::new(),
-                                                }
+                                            StreamEvent::ToolCallStart => {
+                                                UiEvent::ToolCall
                                             }
-                                            StreamEvent::ToolCallDelta(args) => {
-                                                UiEvent::Text(format!(" {}", args))
+                                            StreamEvent::ToolCallDelta => {
+                                                UiEvent::Done
                                             }
                                             StreamEvent::ToolCallEnd => UiEvent::Done,
                                             StreamEvent::ToolExecuting { name, arguments } => {

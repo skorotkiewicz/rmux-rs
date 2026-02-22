@@ -30,6 +30,7 @@ pub struct Tab {
     pub has_notification: bool,
     pub terminal_state: TerminalState,
     pub llm_client: Arc<LlmClient>,
+    pub preset_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,11 +62,15 @@ impl Tab {
         Self {
             id: Uuid::new_v4(),
             workspace_id,
-            title,
+            title: match preset {
+                Some(p) => format!("{} ({})", title, p),
+                None => title,
+            },
             pane_type,
             has_notification: false,
             terminal_state: TerminalState::default(),
             llm_client: client,
+            preset_name: preset.map(|s| s.to_string()),
         }
     }
 }
@@ -192,6 +197,7 @@ impl RmuxApp {
                     llm_client: std::sync::Arc::new(
                         crate::ai::llm_client::LlmClient::default_client(),
                     ),
+                    preset_name: None,
                 };
                 dock_state.push_to_focused_leaf(tab);
             }
@@ -254,18 +260,19 @@ impl RmuxApp {
 
     fn check_pending_notifications(&mut self) {
         let current_workspace = self.current_workspace;
-        
+
         for (workspace_id, dock_state) in self.dock_states.iter_mut() {
             let is_current_workspace = current_workspace == Some(*workspace_id);
             let focused_tab_id = dock_state.find_active_focused().map(|(_, t)| t.id);
-            
+
             for (_surface, node) in dock_state.iter_all_nodes_mut() {
                 if let Some(tabs) = node.tabs_mut() {
                     for tab in tabs {
                         if let Some(ref pending) = tab.terminal_state.pending {
                             if pending.should_notify() {
-                                let is_current_tab = is_current_workspace && focused_tab_id == Some(tab.id);
-                                
+                                let is_current_tab =
+                                    is_current_workspace && focused_tab_id == Some(tab.id);
+
                                 if !is_current_tab {
                                     if let Some(content) = pending.get_assistant_content() {
                                         self.notifications.add_notification(
@@ -488,6 +495,13 @@ impl RmuxApp {
                     for (_surface, node) in dock_state.iter_all_nodes() {
                         if let Some(tabs) = node.tabs() {
                             if let Some(tab) = tabs.first() {
+                                if let Some(ref preset) = tab.preset_name {
+                                    ui.label(
+                                        egui::RichText::new(format!("Preset: {}", preset))
+                                            .small()
+                                            .weak(),
+                                    );
+                                }
                                 let tools = tab.llm_client.get_tools();
                                 let rt = tokio::runtime::Handle::current();
                                 let tools_guard = rt.block_on(async { tools.read().await.clone() });
@@ -643,7 +657,7 @@ impl RmuxApp {
 impl eframe::App for RmuxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_pending_notifications();
-        
+
         if self.show_sidebar {
             egui::SidePanel::left("sidebar")
                 .default_width(self.sidebar_width)
@@ -692,9 +706,9 @@ impl eframe::App for RmuxApp {
                             self.show_notifications = !self.show_notifications;
                         }
                     }
-                    if let Some(ref preset) = self.selected_preset {
-                        ui.label(egui::RichText::new(format!("Preset: {}", preset)).weak());
-                    }
+                    // if let Some(ref preset) = self.selected_preset {
+                    //     ui.label(egui::RichText::new(format!("Preset: {}", preset)).weak());
+                    // }
                 });
             });
         });
@@ -741,7 +755,13 @@ impl TabViewer for TabViewerImpl<'_> {
         let is_focused = self.focused_tab_id == Some(tab.id);
         match tab.pane_type {
             PaneType::Terminal => {
-                TerminalPane::show(ui, tab, self.notifications, tab.llm_client.clone(), is_focused);
+                TerminalPane::show(
+                    ui,
+                    tab,
+                    self.notifications,
+                    tab.llm_client.clone(),
+                    is_focused,
+                );
             }
             PaneType::Browser => {
                 ui.vertical(|ui| {
